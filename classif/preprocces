@@ -21,11 +21,12 @@ class EntityReplacer:
         try:
             with open(f'{model_path}/label_mapping.json', 'r', encoding='utf-8') as f:
                 label_mapping = json.load(f)
-                self.id2label = label_mapping['id2label']
+                # Преобразуем ключи в строки для совместимости
+                self.id2label = {str(k): v for k, v in label_mapping['id2label'].items()}
             print("Загружен пользовательский маппинг меток")
         except:
             # Используем стандартный маппинг модели
-            self.id2label = self.model.config.id2label
+            self.id2label = {str(k): v for k, v in self.model.config.id2label.items()}
             print("Используется стандартный маппинг меток модели")
     
     def replace_entities_in_text(self, text):
@@ -34,114 +35,82 @@ class EntityReplacer:
             return text
         
         try:
-            # Токенизация текста на предложения или части для обработки
-            # Разбиваем текст на части, если он слишком длинный
-            max_length = 510  # Оставляем место для специальных токенов
-            text_parts = []
-            if len(text) > max_length:
-                # Простое разбиение по предложениям или пробелам
-                sentences = re.split(r'(?<=[.!?])\s+', text)
-                current_part = ""
-                for sentence in sentences:
-                    if len(current_part) + len(sentence) <= max_length:
-                        current_part += sentence + " "
-                    else:
-                        if current_part:
-                            text_parts.append(current_part.strip())
-                        current_part = sentence + " "
-                if current_part:
-                    text_parts.append(current_part.strip())
-            else:
-                text_parts = [text]
+            # Токенизация текста
+            inputs = self.tokenizer(
+                text,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+                return_offsets_mapping=True
+            )
             
-            result_parts = []
+            # Убираем offset_mapping из inputs для модели
+            offset_mapping = inputs.pop('offset_mapping')
             
-            for part in text_parts:
-                # Токенизация части текста
-                inputs = self.tokenizer(
-                    part,
-                    padding=True,
-                    truncation=True,
-                    max_length=512,
-                    return_tensors="pt",
-                    return_offsets_mapping=True
-                )
+            # Переносим на устройство
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Предсказание
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                predictions = torch.argmax(outputs.logits, dim=2)
+            
+            # Получаем предсказания для первого примера в батче
+            predictions = predictions[0].cpu().numpy()
+            tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
+            offsets = offset_mapping[0].cpu().numpy()
+            
+            # Обрабатываем результаты
+            result_text = ""
+            current_entity = None
+            
+            for i, (token, pred, (start, end)) in enumerate(zip(tokens, predictions, offsets)):
+                if token in [self.tokenizer.cls_token, self.tokenizer.sep_token, self.tokenizer.pad_token]:
+                    continue
                 
-                # Сохраняем offset_mapping отдельно
-                offset_mapping = inputs['offset_mapping']
+                # Преобразуем предсказание в int для совместимости
+                pred_int = int(pred)
+                label = self.id2label.get(str(pred_int), 'O')
                 
-                # Убираем offset_mapping из inputs для модели
-                model_inputs = {
-                    'input_ids': inputs['input_ids'],
-                    'attention_mask': inputs['attention_mask']
-                }
-                
-                # Переносим на устройство
-                model_inputs = {k: v.to(self.device) for k, v in model_inputs.items()}
-                
-                # Предсказание
-                with torch.no_grad():
-                    outputs = self.model(**model_inputs)
-                    predictions = torch.argmax(outputs.logits, dim=2)
-                
-                # Получаем предсказания для первого примера в батче
-                predictions = predictions[0].cpu().numpy()
-                tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
-                offsets = offset_mapping[0].cpu().numpy()
-                
-                # Обрабатываем результаты
-                result_text = ""
-                current_entity = None
-                entity_start = -1
-                
-                for i, (token, pred, (start, end)) in enumerate(zip(tokens, predictions, offsets)):
-                    if token in [self.tokenizer.cls_token, self.tokenizer.sep_token, self.tokenizer.pad_token]:
-                        continue
-                    
-                    label = self.id2label[pred]
-                    
-                    # Обрабатываем сущности
-                    if label.startswith('B-'):
-                        # Начало новой сущности
-                        if current_entity is not None:
-                            result_text += f"[{current_entity}]"
-                        current_entity = label[2:]  # Убираем B-
-                        entity_start = start
-                    elif label.startswith('I-') and current_entity is not None and current_entity == label[2:]:
-                        # Продолжение сущности - ничего не делаем
-                        pass
-                    elif label == 'O' and current_entity is not None:
-                        # Конец сущности
+                # Обрабатываем сущности
+                if label.startswith('B-'):
+                    # Начало новой сущности
+                    if current_entity is not None:
+                        result_text += f"[{current_entity}]"
+                    current_entity = label[2:]
+                elif label.startswith('I-') and current_entity is not None:
+                    # Продолжение сущности - ничего не делаем
+                    pass
+                elif label == 'O' and current_entity is not None:
+                    # Конец сущности
+                    result_text += f"[{current_entity}]"
+                    current_entity = None
+                    # Добавляем текущий токен
+                    if start < end:
+                        result_text += text[start:end]
+                else:
+                    # Не сущность
+                    if current_entity is not None:
                         result_text += f"[{current_entity}]"
                         current_entity = None
-                        # Добавляем текущий токен
-                        if start < end:
-                            result_text += part[start:end]
-                    else:
-                        # Не сущность
-                        if current_entity is not None:
-                            result_text += f"[{current_entity}]"
-                            current_entity = None
-                        if start < end:
-                            result_text += part[start:end]
-                
-                # Добавляем последнюю сущность если есть
-                if current_entity is not None:
-                    result_text += f"[{current_entity}]"
-                
-                result_parts.append(result_text)
+                    if start < end:
+                        result_text += text[start:end]
             
-            # Объединяем все части
-            final_result = " ".join(result_parts)
+            # Добавляем последнюю сущность если есть
+            if current_entity is not None:
+                result_text += f"[{current_entity}]"
             
             # Если результат пустой, возвращаем исходный текст
-            if not final_result.strip():
+            if not result_text.strip():
                 return text
                 
-            return final_result
+            return result_text
             
         except Exception as e:
             print(f"Ошибка при обработке текста: {e}")
+            import traceback
+            print(f"Детали ошибки: {traceback.format_exc()}")
             return text
 
 def process_json_file(input_file, model_path, output_file):
