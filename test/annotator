@@ -1,6 +1,506 @@
 python -m http.server 8000
 
-/* Добавляем стили для подсказок контекста */
+// Глобальные переменные
+let csvData = [];
+let currentRowIndex = 0;
+let selectedTokens = [];
+let currentFile = null;
+
+// Загрузка файла
+document.getElementById('loadBtn').addEventListener('click', function() {
+    const fileInput = document.getElementById('csvFile');
+    const file = fileInput.files[0];
+    
+    if (!file) {
+        showStatus('Пожалуйста, выберите файл', 'error');
+        return;
+    }
+    
+    currentFile = file;
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        try {
+            parseCSV(e.target.result);
+            showStatus('Файл успешно загружен', 'success');
+            displayRow(currentRowIndex);
+        } catch (error) {
+            showStatus('Ошибка при загрузке файла: ' + error.message, 'error');
+        }
+    };
+    reader.readAsText(file);
+});
+
+// Парсинг CSV
+function parseCSV(csvText) {
+    const lines = csvText.split('\n');
+    const headers = parseCSVLine(lines[0]);
+    
+    csvData = [];
+    
+    for (let i = 1; i < lines.length; i++) {
+        if (lines[i].trim() === '') continue;
+        
+        const values = parseCSVLine(lines[i]);
+        if (values.length < headers.length) continue;
+        
+        const row = {};
+        for (let j = 0; j < headers.length; j++) {
+            let value = values[j];
+            
+            // Парсинг массивов из строки
+            if (value.startsWith('[') && value.endsWith(']')) {
+                try {
+                    // Заменяем двойные кавычки на одинарные для корректного парсинга JSON
+                    value = value.replace(/""/g, '"');
+                    value = JSON.parse(value);
+                } catch (e) {
+                    // Если не удалось распарсить, оставляем как строку
+                    console.warn('Не удалось распарсить массив:', value);
+                }
+            }
+            
+            // Преобразование строки 'True'/'False' в boolean
+            if (value === 'True' || value === 'true') value = true;
+            if (value === 'False' || value === 'false') value = false;
+            
+            row[headers[j]] = value;
+        }
+        
+        // Проверяем, что есть необходимые поля
+        if (!row.tokens || !row.ner_tags) {
+            console.warn('Строка не содержит tokens или ner_tags:', row);
+            continue;
+        }
+        
+        // Убеждаемся, что tokens и ner_tags являются массивами
+        if (typeof row.tokens === 'string') {
+            try {
+                row.tokens = JSON.parse(row.tokens.replace(/""/g, '"'));
+            } catch (e) {
+                row.tokens = [row.tokens];
+            }
+        }
+        
+        if (typeof row.ner_tags === 'string') {
+            try {
+                row.ner_tags = JSON.parse(row.ner_tags.replace(/""/g, '"'));
+            } catch (e) {
+                row.ner_tags = [row.ner_tags];
+            }
+        }
+        
+        csvData.push(row);
+    }
+    
+    if (csvData.length === 0) {
+        throw new Error('Файл не содержит данных или имеет неверный формат');
+    }
+}
+
+// Парсинг строки CSV с учетом кавычек
+function parseCSVLine(line) {
+    const result = [];
+    let current = '';
+    let inQuotes = false;
+    
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        
+        if (char === '"') {
+            if (inQuotes && line[i + 1] === '"') {
+                current += '"';
+                i++; // Пропускаем следующую кавычку
+            } else {
+                inQuotes = !inQuotes;
+            }
+        } else if (char === ',' && !inQuotes) {
+            result.push(current);
+            current = '';
+        } else {
+            current += char;
+        }
+    }
+    
+    result.push(current);
+    return result;
+}
+
+// Отображение текущей строки
+function displayRow(index) {
+    if (csvData.length === 0 || index < 0 || index >= csvData.length) {
+        return;
+    }
+    
+    const row = csvData[index];
+    
+    // Обновление информации о строке
+    document.getElementById('dialogId').textContent = row.dialog_id || '';
+    document.getElementById('messageIndex').textContent = row.dialog_message_index || '';
+    document.getElementById('originalText').textContent = row.original_text || '';
+    document.getElementById('successStatus').textContent = row.success ? 'Успешно' : 'Ошибка';
+    
+    // Обновление индекса
+    document.getElementById('currentIndex').textContent = `${index + 1}/${csvData.length}`;
+    
+    // Отображение токенов
+    displayTokens(row.tokens || [], row.ner_tags || []);
+    
+    // Сброс выбранных токенов
+    selectedTokens = [];
+}
+
+// Отображение токенов с разметкой и контекстными подсказками
+function displayTokens(tokens, tags) {
+    const container = document.getElementById('tokensContainer');
+    container.innerHTML = '';
+    
+    if (tokens.length !== tags.length) {
+        container.innerHTML = '<p>Ошибка: количество токенов и меток не совпадает</p>';
+        return;
+    }
+    
+    // Добавляем информацию о выбранных токенах
+    if (selectedTokens.length > 0) {
+        const selectionInfo = document.createElement('div');
+        selectionInfo.className = 'selection-info';
+        
+        const selectedText = selectedTokens.map(i => tokens[i]).join(' ');
+        const isSequential = isSelectionSequential();
+        
+        selectionInfo.innerHTML = `
+            <strong>Выбрано токенов:</strong> ${selectedTokens.length}<br>
+            <strong>Текст:</strong> "${selectedText}"<br>
+            <strong>Последовательные:</strong> ${isSequential ? 'Да' : 'Нет'}
+        `;
+        
+        container.appendChild(selectionInfo);
+    }
+    
+    for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i];
+        const tag = tags[i];
+        
+        const tokenElement = document.createElement('div');
+        tokenElement.className = `token token-${tag}`;
+        tokenElement.textContent = token;
+        tokenElement.dataset.index = i;
+        tokenElement.title = `Токен: ${token}\nМетка: ${tag}`;
+        
+        // Добавляем контекстные подсказки для последовательностей
+        if (i > 0 && tag.startsWith('I-') && tags[i-1] === `B-${tag.substring(2)}`) {
+            tokenElement.classList.add('context-after');
+        }
+        if (i < tokens.length - 1 && tag.startsWith('B-') && tags[i+1] === `I-${tag.substring(2)}`) {
+            tokenElement.classList.add('context-before');
+        }
+        
+        tokenElement.addEventListener('click', function(e) {
+            e.preventDefault();
+            toggleTokenSelection(i);
+        });
+        
+        container.appendChild(tokenElement);
+    }
+}
+
+// Проверка, являются ли выбранные токены последовательными
+function isSelectionSequential() {
+    if (selectedTokens.length < 2) return true;
+    
+    return selectedTokens.every((tokenIndex, i, arr) => {
+        return i === 0 || tokenIndex === arr[i - 1] + 1;
+    });
+}
+
+// Переключение выбора токена
+function toggleTokenSelection(index) {
+    const tokenIndex = selectedTokens.indexOf(index);
+    
+    if (tokenIndex === -1) {
+        // Добавление токена к выбранным
+        selectedTokens.push(index);
+        document.querySelector(`.token[data-index="${index}"]`).classList.add('selected');
+    } else {
+        // Удаление токена из выбранных
+        selectedTokens.splice(tokenIndex, 1);
+        document.querySelector(`.token[data-index="${index}"]`).classList.remove('selected');
+    }
+    
+    // Сортируем выбранные токены по порядку
+    selectedTokens.sort((a, b) => a - b);
+    
+    // Обновляем отображение для показа информации о выбранной последовательности
+    displayTokens(csvData[currentRowIndex].tokens, csvData[currentRowIndex].ner_tags);
+}
+
+// Назначение метки выбранным токенам
+document.querySelectorAll('.tag-btn').forEach(button => {
+    button.addEventListener('click', function() {
+        if (csvData.length === 0) {
+            showStatus('Сначала загрузите файл', 'error');
+            return;
+        }
+        
+        if (selectedTokens.length === 0) {
+            showStatus('Выберите хотя бы один токен', 'error');
+            return;
+        }
+        
+        const tag = this.dataset.tag;
+        const row = csvData[currentRowIndex];
+        const tokens = row.tokens;
+        const nerTags = row.ner_tags;
+        
+        // Сортируем выбранные токены по порядку
+        selectedTokens.sort((a, b) => a - b);
+        
+        // Для метки O назначаем всем токенам O
+        if (tag === 'O') {
+            selectedTokens.forEach(index => {
+                nerTags[index] = 'O';
+            });
+            
+            const selectedText = selectedTokens.map(i => tokens[i]).join(' ');
+            showStatus(`Токены "${selectedText}" помечены как O`, 'success');
+        } else {
+            // Умная логика назначения B- и I- префиксов с учетом контекста
+            
+            // Проверяем контекст перед первым выбранным токеном
+            const firstSelected = selectedTokens[0];
+            const prevTag = firstSelected > 0 ? nerTags[firstSelected - 1] : null;
+            
+            // Проверяем, является ли предыдущий токен такой же сущностью с I- префиксом
+            const isContinuation = prevTag && prevTag === `I-${tag}`;
+            
+            // Проверяем, является ли предыдущий токен такой же сущностью с B- префиксом
+            const isAfterBeginning = prevTag && prevTag === `B-${tag}`;
+            
+            let usedPrefix = 'B-';
+            
+            if (isContinuation || isAfterBeginning) {
+                // Если продолжаем существующую сущность, все токены получают I- префикс
+                selectedTokens.forEach(index => {
+                    nerTags[index] = `I-${tag}`;
+                });
+                usedPrefix = 'I-';
+            } else {
+                // Если начинаем новую сущность
+                selectedTokens.forEach((index, i) => {
+                    // Первый токен получает B-, остальные I-
+                    const prefix = i === 0 ? 'B-' : 'I-';
+                    nerTags[index] = prefix + tag;
+                });
+            }
+            
+            // Проверяем контекст после последнего выбранного токена
+            const lastSelected = selectedTokens[selectedTokens.length - 1];
+            const nextTag = lastSelected < tokens.length - 1 ? nerTags[lastSelected + 1] : null;
+            
+            // Если следующий токен имеет I- префикс для этой же сущности, но мы его не выбрали,
+            // спрашиваем пользователя, хочет ли он продолжить разметку
+            if (nextTag && nextTag === `I-${tag}` && !selectedTokens.includes(lastSelected + 1)) {
+                setTimeout(() => {
+                    if (confirm('Следующий токен уже помечен как продолжение этой сущности. Хотите включить его в разметку?')) {
+                        // Рекурсивно добавляем следующие токены с I- префиксом той же сущности
+                        let nextIndex = lastSelected + 1;
+                        const tokensToAdd = [];
+                        
+                        while (nextIndex < tokens.length && nerTags[nextIndex] === `I-${tag}`) {
+                            tokensToAdd.push(nextIndex);
+                            nextIndex++;
+                        }
+                        
+                        // Добавляем найденные токены к выбранным
+                        selectedTokens.push(...tokensToAdd);
+                        selectedTokens.sort((a, b) => a - b);
+                        
+                        // Обновляем отображение
+                        displayTokens(row.tokens, row.ner_tags);
+                        
+                        showStatus(`Добавлено ${tokensToAdd.length} токенов к разметке`, 'success');
+                    }
+                }, 100);
+            }
+            
+            const selectedText = selectedTokens.map(i => tokens[i]).join(' ');
+            showStatus(`Токены "${selectedText}" помечены как ${usedPrefix}${tag}`, 'success');
+        }
+        
+        // Обновляем отображение
+        displayTokens(row.tokens, row.ner_tags);
+        
+        // Очищаем выбранные токены
+        selectedTokens = [];
+        
+        // Помечаем строку как измененную
+        row.success = true;
+        document.getElementById('successStatus').textContent = 'Успешно (изменено)';
+    });
+});
+
+// Навигация
+document.getElementById('prevBtn').addEventListener('click', function() {
+    if (currentRowIndex > 0) {
+        currentRowIndex--;
+        displayRow(currentRowIndex);
+        showStatus(`Переход к строке ${currentRowIndex + 1}`, 'success');
+    }
+});
+
+document.getElementById('nextBtn').addEventListener('click', function() {
+    if (currentRowIndex < csvData.length - 1) {
+        currentRowIndex++;
+        displayRow(currentRowIndex);
+        showStatus(`Переход к строке ${currentRowIndex + 1}`, 'success');
+    }
+});
+
+// Удаление строки
+document.getElementById('deleteBtn').addEventListener('click', function() {
+    if (csvData.length === 0) return;
+    
+    if (confirm('Вы уверены, что хотите удалить эту строку?')) {
+        csvData.splice(currentRowIndex, 1);
+        
+        if (csvData.length === 0) {
+            // Если удалили все строки
+            document.getElementById('tokensContainer').innerHTML = '';
+            document.getElementById('currentIndex').textContent = '0/0';
+            document.getElementById('dialogId').textContent = '';
+            document.getElementById('messageIndex').textContent = '';
+            document.getElementById('originalText').textContent = '';
+            document.getElementById('successStatus').textContent = '';
+            showStatus('Все строки удалены', 'success');
+            return;
+        }
+        
+        // Корректируем индекс, если удалили последнюю строку
+        if (currentRowIndex >= csvData.length) {
+            currentRowIndex = csvData.length - 1;
+        }
+        
+        displayRow(currentRowIndex);
+        showStatus('Строка удалена', 'success');
+    }
+});
+
+// Сохранение изменений
+document.getElementById('saveBtn').addEventListener('click', function() {
+    if (csvData.length === 0) {
+        showStatus('Нет данных для сохранения', 'error');
+        return;
+    }
+    
+    // Сохраняем изменения в текущий файл (в памяти)
+    showStatus('Изменения сохранены в памяти', 'success');
+});
+
+// Экспорт CSV
+document.getElementById('exportBtn').addEventListener('click', function() {
+    if (csvData.length === 0) {
+        showStatus('Нет данных для экспорта', 'error');
+        return;
+    }
+    
+    // Получаем заголовки из первой строки
+    const headers = Object.keys(csvData[0]);
+    
+    // Создаем CSV содержимое
+    let csvContent = headers.map(h => `"${h}"`).join(',') + '\n';
+    
+    csvData.forEach(row => {
+        const values = headers.map(header => {
+            let value = row[header];
+            
+            // Если значение - массив, преобразуем в строку JSON
+            if (Array.isArray(value)) {
+                // Экранируем кавычки внутри массива
+                const arrayStr = JSON.stringify(value)
+                    .replace(/"/g, '""'); // Экранируем кавычки для CSV
+                return `"${arrayStr}"`;
+            }
+            
+            // Если значение - булево, преобразуем в строку
+            if (typeof value === 'boolean') {
+                return value ? 'True' : 'False';
+            }
+            
+            // Экранируем кавычки и оборачиваем в кавычки, если содержит запятые или кавычки
+            if (typeof value === 'string' && (value.includes(',') || value.includes('"') || value.includes('\n'))) {
+                value = value.replace(/"/g, '""');
+                return `"${value}"`;
+            }
+            
+            return value;
+        });
+        
+        csvContent += values.join(',') + '\n';
+    });
+    
+    // Создаем и скачиваем файл
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', currentFile ? `updated_${currentFile.name}` : 'ner_data_updated.csv');
+    link.style.visibility = 'hidden';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    
+    showStatus('Файл экспортирован', 'success');
+});
+
+// Показать статусное сообщение
+function showStatus(message, type) {
+    const statusElement = document.getElementById('statusMessage');
+    statusElement.textContent = message;
+    statusElement.className = `status-message ${type}`;
+    statusElement.style.display = 'block';
+    
+    // Автоматически скрыть через 5 секунды
+    setTimeout(() => {
+        statusElement.style.display = 'none';
+    }, 5000);
+}
+
+// Горячие клавиши
+document.addEventListener('keydown', function(e) {
+    // Ctrl+Стрелка влево - предыдущая строка
+    if (e.ctrlKey && e.key === 'ArrowLeft') {
+        e.preventDefault();
+        document.getElementById('prevBtn').click();
+    }
+    
+    // Ctrl+Стрелка вправо - следующая строка
+    if (e.ctrlKey && e.key === 'ArrowRight') {
+        e.preventDefault();
+        document.getElementById('nextBtn').click();
+    }
+    
+    // Escape - сброс выбора токенов
+    if (e.key === 'Escape') {
+        selectedTokens = [];
+        if (csvData.length > 0) {
+            displayTokens(csvData[currentRowIndex].tokens, csvData[currentRowIndex].ner_tags);
+        }
+    }
+});
+
+// Инициализация при загрузке страницы
+document.addEventListener('DOMContentLoaded', function() {
+    showStatus('Загрузите CSV файл для начала работы', 'success');
+    
+    // Добавляем подсказку о горячих клавишах
+    const hotkeyInfo = document.createElement('div');
+    hotkeyInfo.style.marginTop = '10px';
+    hotkeyInfo.style.fontSize = '0.9em';
+    hotkeyInfo.style.color = '#6c757d';
+    hotkeyInfo.innerHTML = '<strong>Горячие клавиши:</strong> Ctrl+←/→ - навигация, Esc - сброс выбора';
+    document.querySelector('.upload-section').appendChild(hotkeyInfo);
+});
+
+/* Добавляем стили для подсказок контекста и информации о выборе */
 .token.context-before {
     border-left: 3px solid #28a745;
 }
@@ -15,7 +515,26 @@ python -m http.server 8000
     border-radius: 4px;
     margin-bottom: 10px;
     font-size: 0.9em;
+    border-left: 4px solid #007bff;
 }
 
-/* ... остальные стили без изменений ... */
+.token {
+    position: relative;
+}
 
+.token:hover::after {
+    content: attr(title);
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #333;
+    color: white;
+    padding: 5px;
+    border-radius: 4px;
+    font-size: 0.8em;
+    white-space: pre-line;
+    z-index: 10;
+    min-width: 150px;
+    text-align: center;
+}
