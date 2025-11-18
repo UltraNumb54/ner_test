@@ -1,0 +1,424 @@
+# topic_clustering.py
+import json
+import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+import re
+from tqdm import tqdm
+import os
+
+class AdvancedTopicClustering:
+    def __init__(self, model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'):
+        """Инициализация модели для создания эмбеддингов"""
+        print(f"Загрузка модели {model_name}...")
+        self.model = SentenceTransformer(model_name)
+        print("Модель загружена успешно!")
+    
+    def preprocess_texts(self, json_file):
+        """Подготовка текстов для кластеризации из предобработанного JSON"""
+        print("Чтение предобработанного JSON файла...")
+        
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        dialog_texts = []
+        dialog_info = []
+        
+        for dialog in data:
+            text = dialog.get('text', '')
+            
+            # Очищаем текст от лишних пробелов
+            clean_text = re.sub(r'\s+', ' ', text).strip()
+            
+            if len(clean_text) > 20:  # Пропускаем слишком короткие тексты
+                dialog_texts.append(clean_text)
+                dialog_info.append({
+                    'dialog_id': dialog['id'],
+                    'original_topic': dialog.get('original_topic', 'unknown'),
+                    'source': dialog.get('source', 'unknown'),
+                    'timestamp': dialog.get('timestamp', ''),
+                    'text_length': len(clean_text),
+                    'message_count': dialog.get('message_count', 0)
+                })
+        
+        print(f"Подготовлено {len(dialog_texts)} диалогов для кластеризации")
+        return dialog_texts, dialog_info
+    
+    def create_embeddings(self, texts, batch_size=32):
+        """Создание векторных представлений текстов"""
+        print("Создание эмбеддингов...")
+        
+        embeddings = self.model.encode(
+            texts, 
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
+        
+        print(f"Создано эмбеддингов: {embeddings.shape}")
+        return embeddings
+    
+    def find_optimal_clusters(self, embeddings, max_k=15):
+        """Поиск оптимального количества кластеров методом локтя и silhouette"""
+        print("Поиск оптимального количества кластеров...")
+        
+        if len(embeddings) <= 2:
+            print("Слишком мало данных для анализа кластеров")
+            return 2
+        
+        max_k = min(max_k, len(embeddings) - 1)
+        if max_k < 2:
+            return 2
+        
+        wcss = []  # Within-Cluster Sum of Squares
+        silhouette_scores = []
+        k_range = range(2, max_k + 1)
+        
+        for k in tqdm(k_range, desc="Анализ кластеров"):
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(embeddings)
+            wcss.append(kmeans.inertia_)
+            
+            if len(set(labels)) > 1:
+                score = silhouette_score(embeddings, labels)
+                silhouette_scores.append(score)
+            else:
+                silhouette_scores.append(0)
+        
+        # Находим оптимальное k по методу локтя
+        optimal_k_elbow = 2
+        if len(wcss) > 1:
+            differences = [wcss[i-1] - wcss[i] for i in range(1, len(wcss))]
+            for i in range(1, len(differences)-1):
+                if differences[i] < differences[i-1] * 0.7:
+                    optimal_k_elbow = k_range[i]
+                    break
+        
+        # Находим оптимальное k по silhouette score
+        optimal_k_silhouette = k_range[np.argmax(silhouette_scores)] if silhouette_scores else 2
+        
+        print(f"Оптимальное количество кластеров (метод локтя): {optimal_k_elbow}")
+        print(f"Оптимальное количество кластеров (silhouette): {optimal_k_silhouette}")
+        
+        # Визуализация если есть достаточно точек
+        if len(k_range) > 1:
+            self._plot_cluster_analysis(k_range, wcss, silhouette_scores, 
+                                      optimal_k_elbow, optimal_k_silhouette)
+        
+        # Возвращаем оптимальное значение
+        return max(optimal_k_elbow, optimal_k_silhouette)
+    
+    def _plot_cluster_analysis(self, k_range, wcss, silhouette_scores, k_elbow, k_silhouette):
+        """Визуализация анализа кластеров"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        
+        # Метод локтя
+        ax1.plot(k_range, wcss, 'bo-')
+        ax1.axvline(x=k_elbow, color='red', linestyle='--', alpha=0.7, label=f'Оптимум: {k_elbow}')
+        ax1.set_xlabel('Количество кластеров')
+        ax1.set_ylabel('WCSS')
+        ax1.set_title('Метод локтя')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Silhouette score
+        ax2.plot(k_range, silhouette_scores, 'go-')
+        ax2.axvline(x=k_silhouette, color='red', linestyle='--', alpha=0.7, label=f'Оптимум: {k_silhouette}')
+        ax2.set_xlabel('Количество кластеров')
+        ax2.set_ylabel('Silhouette Score')
+        ax2.set_title('Silhouette Analysis')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('cluster_analysis.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print("График анализа кластеров сохранен как 'cluster_analysis.png'")
+    
+    def perform_clustering(self, embeddings, n_clusters=None):
+        """Выполнение кластеризации K-means"""
+        if n_clusters is None:
+            n_clusters = min(10, max(2, len(embeddings) // 10))
+        
+        print(f"Выполнение K-means кластеризации с {n_clusters} кластерами...")
+        
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(embeddings)
+        
+        # Оценка качества кластеризации
+        if len(set(labels)) > 1:
+            score = silhouette_score(embeddings, labels)
+            print(f"Silhouette Score: {score:.4f}")
+        else:
+            print("Создан только один кластер")
+        
+        return labels, kmeans
+    
+    def extract_cluster_keywords(self, texts, labels, top_n=10):
+        """Извлечение ключевых слов для каждого кластера"""
+        print("Извлечение ключевых слов кластеров...")
+        
+        cluster_keywords = {}
+        
+        for cluster_id in set(labels):
+            cluster_texts = [text for text, label in zip(texts, labels) if label == cluster_id]
+            
+            if cluster_texts:
+                # Объединяем все тексты кластера
+                all_text = " ".join(cluster_texts)
+                
+                # Извлекаем слова (игнорируем стоп-слова и короткие слова)
+                # Учитываем как обычные слова, так и метки сущностей [ENTITY_TYPE]
+                words = re.findall(r'\b[а-яё]{4,}\b|\[[A-Z_]+\]', all_text.lower())
+                
+                # Считаем частотность
+                word_counts = Counter(words)
+                
+                # Исключаем стоп-слова (только для обычных слов, не для меток)
+                stop_words = {'этот', 'такой', 'какой', 'который', 'очень', 'много', 
+                             'можно', 'нужно', 'должен', 'хочу', 'хотеть', 'хотят', 
+                             'свой', 'мочь', 'говорить', 'сказать', 'дело', 'время', 
+                             'человек', 'работа', 'компания', 'город'}
+                
+                keywords = [(word, count) for word, count in word_counts.most_common(50) 
+                           if (not word.startswith('[') and word not in stop_words and count > 1) 
+                           or word.startswith('[')]
+                
+                cluster_keywords[cluster_id] = keywords[:top_n]
+        
+        return cluster_keywords
+    
+    def assign_topic_names(self, cluster_keywords):
+        """Присвоение понятных названий темам"""
+        topic_names = {}
+        
+        for cluster_id, keywords in cluster_keywords.items():
+            if keywords:
+                # Берем топ-3 ключевых слова для названия (исключая метки сущностей)
+                regular_keywords = [word for word, count in keywords if not word.startswith('[')][:3]
+                if regular_keywords:
+                    topic_name = f"Тема_{cluster_id}_{'_'.join(regular_keywords[:2])}"
+                else:
+                    # Если только метки сущностей, используем их
+                    entity_keywords = [word for word, count in keywords if word.startswith('[')][:2]
+                    topic_name = f"Тема_{cluster_id}_{'_'.join([e[1:-1] for e in entity_keywords])}"
+            else:
+                topic_name = f"Тема_{cluster_id}"
+            
+            topic_names[cluster_id] = {
+                'name': topic_name,
+                'keywords': [word for word, count in keywords[:8]],
+                'keyword_scores': {word: count for word, count in keywords[:8]}
+            }
+        
+        return topic_names
+    
+    def visualize_clusters(self, embeddings, labels, topic_names, output_file='clusters_visualization.png'):
+        """Визуализация кластеров с помощью PCA"""
+        print("Визуализация кластеров...")
+        
+        # Уменьшаем размерность до 2D для визуализации
+        pca = PCA(n_components=2, random_state=42)
+        embeddings_2d = pca.fit_transform(embeddings)
+        
+        plt.figure(figsize=(14, 10))
+        
+        # Создаем датафрейм для удобства
+        df = pd.DataFrame({
+            'x': embeddings_2d[:, 0],
+            'y': embeddings_2d[:, 1],
+            'cluster': labels,
+            'topic': [topic_names.get(label, {}).get('name', f'Cluster {label}') for label in labels]
+        })
+        
+        # Рисуем scatter plot
+        scatter = plt.scatter(df['x'], df['y'], c=df['cluster'], cmap='tab20', alpha=0.7, s=60)
+        
+        # Добавляем центроиды и подписи только для крупных кластеров
+        for cluster_id in set(labels):
+            cluster_points = df[df['cluster'] == cluster_id]
+            if len(cluster_points) > 0:
+                centroid_x = cluster_points['x'].mean()
+                centroid_y = cluster_points['y'].mean()
+                plt.scatter(centroid_x, centroid_y, marker='x', s=200, linewidths=3, 
+                           color='red', alpha=0.8)
+                
+                # Подписываем только если кластер достаточно большой
+                if len(cluster_points) > max(1, len(df) * 0.05):  # хотя бы 5% от всех точек
+                    topic_name = topic_names.get(cluster_id, {}).get('name', f'Cluster {cluster_id}')
+                    plt.annotate(topic_name, (centroid_x, centroid_y), 
+                                xytext=(5, 5), textcoords='offset points',
+                                fontsize=8, alpha=0.9, weight='bold',
+                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+        
+        plt.colorbar(scatter)
+        plt.title('Визуализация кластеров диалогов (PCA)', fontsize=14)
+        plt.xlabel('Главная компонента 1')
+        plt.ylabel('Главная компонента 2')
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Визуализация кластеров сохранена как '{output_file}'")
+    
+    def save_results(self, input_file, clustered_data, topic_names, output_file):
+        """Сохранение результатов кластеризации"""
+        print("Сохранение результатов...")
+        
+        with open(input_file, 'r', encoding='utf-8') as f:
+            original_data = json.load(f)
+        
+        # Создаем маппинг dialog_id -> topic_info
+        topic_mapping = {}
+        for item in clustered_data:
+            topic_mapping[item['dialog_id']] = {
+                'cluster_id': int(item['cluster_id']),
+                'topic_name': topic_names[item['cluster_id']]['name'],
+                'topic_keywords': topic_names[item['cluster_id']]['keywords'],
+                'cluster_size': len([x for x in clustered_data if x['cluster_id'] == item['cluster_id']])
+            }
+        
+        # Обновляем исходные данные
+        for dialog in original_data:
+            dialog_id = dialog['id']
+            if dialog_id in topic_mapping:
+                dialog['predicted_topic'] = topic_mapping[dialog_id]['topic_name']
+                dialog['topic_cluster'] = topic_mapping[dialog_id]['cluster_id']
+                dialog['topic_keywords'] = topic_mapping[dialog_id]['topic_keywords']
+                dialog['cluster_size'] = topic_mapping[dialog_id]['cluster_size']
+                dialog['clustering_method'] = 'sentence-transformers + K-means'
+            else:
+                dialog['predicted_topic'] = 'Не распределен'
+                dialog['topic_cluster'] = -1
+                dialog['topic_keywords'] = []
+                dialog['cluster_size'] = 0
+        
+        # Сохраняем результат
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(original_data, f, ensure_ascii=False, indent=2)
+        
+        # Статистика
+        self._print_statistics(original_data)
+        
+        return original_data
+    
+    def _print_statistics(self, data):
+        """Вывод статистики кластеризации"""
+        topic_stats = {}
+        cluster_sizes = {}
+        
+        for dialog in data:
+            topic = dialog['predicted_topic']
+            cluster = dialog['topic_cluster']
+            
+            if topic not in topic_stats:
+                topic_stats[topic] = 0
+            topic_stats[topic] += 1
+            
+            if cluster not in cluster_sizes:
+                cluster_sizes[cluster] = 0
+            cluster_sizes[cluster] += 1
+        
+        print("\n" + "="*60)
+        print("СТАТИСТИКА КЛАСТЕРИЗАЦИИ")
+        print("="*60)
+        print(f"Всего диалогов: {len(data)}")
+        print(f"Количество тем: {len([t for t in topic_stats.keys() if t != 'Не распределен'])}")
+        
+        print("\nРаспределение по темам:")
+        for topic, count in sorted(topic_stats.items(), key=lambda x: x[1], reverse=True):
+            percentage = (count / len(data)) * 100
+            print(f"  {topic}: {count} диалогов ({percentage:.1f}%)")
+        
+        print(f"\nРазмеры кластеров:")
+        for cluster, size in sorted(cluster_sizes.items()):
+            if cluster != -1:  # Исключаем нераспределенные
+                total_clustered = len([d for d in data if d['topic_cluster'] != -1])
+                if total_clustered > 0:
+                    percentage = (size / total_clustered) * 100
+                    print(f"  Кластер {cluster}: {size} диалогов ({percentage:.1f}%)")
+
+def main():
+    """Основная функция с путями в коде"""
+    
+    # УКАЖИТЕ ВАШИ ПУТИ К ФАЙЛАМ ЗДЕСЬ:
+    
+    INPUT_FILE = "data/preprocessed_dialogs.json"  # Путь к предобработанному JSON файлу
+    OUTPUT_FILE = "data/clustered_results.json"    # Путь для сохранения результатов кластеризации
+    MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # Модель для эмбеддингов
+    NUM_CLUSTERS = None  # Автоопределение (или укажите число, например: 5)
+    BATCH_SIZE = 32      # Размер батча для создания эмбеддингов
+    
+    print("Запуск кластеризации тем...")
+    print(f"Входной файл: {INPUT_FILE}")
+    print(f"Выходной файл: {OUTPUT_FILE}")
+    print(f"Модель: {MODEL_NAME}")
+    print(f"Количество кластеров: {'авто' if NUM_CLUSTERS is None else NUM_CLUSTERS}")
+    print("=" * 60)
+    
+    # Проверка существования файла
+    if not os.path.exists(INPUT_FILE):
+        print(f"Ошибка: Файл {INPUT_FILE} не существует")
+        print("Сначала выполните предобработку данных (preprocess_entities.py)")
+        return
+    
+    # Создаем папку для выходного файла если не существует
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+    
+    # Инициализация кластеризатора
+    clusterer = AdvancedTopicClustering(MODEL_NAME)
+    
+    # Подготовка данных
+    texts, dialog_info = clusterer.preprocess_texts(INPUT_FILE)
+    
+    if len(texts) < 3:
+        print("Недостаточно данных для кластеризации (нужно минимум 3 диалога)")
+        return
+    
+    # Создание эмбеддингов
+    embeddings = clusterer.create_embeddings(texts, BATCH_SIZE)
+    
+    # Определение оптимального количества кластеров
+    if NUM_CLUSTERS is None:
+        NUM_CLUSTERS = clusterer.find_optimal_clusters(embeddings)
+    else:
+        NUM_CLUSTERS = min(NUM_CLUSTERS, len(texts))
+    
+    print(f"Используется {NUM_CLUSTERS} кластеров для кластеризации")
+    
+    # Кластеризация
+    labels, kmeans = clusterer.perform_clustering(embeddings, NUM_CLUSTERS)
+    
+    # Анализ кластеров
+    cluster_keywords = clusterer.extract_cluster_keywords(texts, labels)
+    topic_names = clusterer.assign_topic_names(cluster_keywords)
+    
+    # Подготовка данных для сохранения
+    clustered_data = []
+    for text, info, label in zip(texts, dialog_info, labels):
+        clustered_data.append({
+            **info,
+            'text_preview': text[:100] + '...' if len(text) > 100 else text,
+            'cluster_id': int(label)
+        })
+    
+    # Визуализация
+    clusterer.visualize_clusters(embeddings, labels, topic_names)
+    
+    # Сохранение результатов
+    clusterer.save_results(INPUT_FILE, clustered_data, topic_names, OUTPUT_FILE)
+    
+    print(f"Кластеризация завершена! Результаты сохранены в {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
