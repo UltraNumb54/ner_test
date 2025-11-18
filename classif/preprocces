@@ -29,12 +29,29 @@ class EntityReplacer:
             self.id2label = {str(k): v for k, v in self.model.config.id2label.items()}
             print("Используется стандартный маппинг меток модели")
     
+    def clean_text(self, text):
+        """Очистка текста от лишних пробелов и специальных символов"""
+        if not text:
+            return ""
+        
+        # Заменяем множественные пробелы на один
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Убираем специальные символы, которые могут мешать (опционально)
+        # Можно раскомментировать при необходимости
+        # text = re.sub(r'[^\w\s\[\],.!?;:-]', '', text)
+        
+        return text.strip()
+    
     def replace_entities_in_text(self, text):
-        """Замена сущностей на метки в тексте"""
+        """Замена сущностей на метки в тексте с сохранением пробелов"""
         if not text or len(text.strip()) == 0:
             return text
         
         try:
+            # Очищаем текст перед обработкой
+            text = self.clean_text(text)
+            
             # Токенизация текста
             inputs = self.tokenizer(
                 text,
@@ -61,9 +78,10 @@ class EntityReplacer:
             tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
             offsets = offset_mapping[0].cpu().numpy()
             
-            # Обрабатываем результаты
-            result_text = ""
+            # Обрабатываем результаты с сохранением пробелов
+            result_parts = []
             current_entity = None
+            current_entity_type = None
             
             for i, (token, pred, (start, end)) in enumerate(zip(tokens, predictions, offsets)):
                 if token in [self.tokenizer.cls_token, self.tokenizer.sep_token, self.tokenizer.pad_token]:
@@ -77,29 +95,34 @@ class EntityReplacer:
                 if label.startswith('B-'):
                     # Начало новой сущности
                     if current_entity is not None:
-                        result_text += f"[{current_entity}]"
-                    current_entity = label[2:]
-                elif label.startswith('I-') and current_entity is not None:
-                    # Продолжение сущности - ничего не делаем
+                        # Сохраняем предыдущую сущность
+                        result_parts.append(f"[{current_entity_type}]")
+                    current_entity = []
+                    current_entity_type = label[2:]
+                elif label.startswith('I-') and current_entity is not None and current_entity_type == label[2:]:
+                    # Продолжение сущности
                     pass
-                elif label == 'O' and current_entity is not None:
-                    # Конец сущности
-                    result_text += f"[{current_entity}]"
-                    current_entity = None
-                    # Добавляем текущий токен
-                    if start < end:
-                        result_text += text[start:end]
-                else:
+                elif label == 'O':
                     # Не сущность
                     if current_entity is not None:
-                        result_text += f"[{current_entity}]"
+                        # Завершаем текущую сущность
+                        result_parts.append(f"[{current_entity_type}]")
                         current_entity = None
+                        current_entity_type = None
+                    
+                    # Добавляем обычный текст с пробелами
                     if start < end:
-                        result_text += text[start:end]
+                        result_parts.append(text[start:end])
             
             # Добавляем последнюю сущность если есть
             if current_entity is not None:
-                result_text += f"[{current_entity}]"
+                result_parts.append(f"[{current_entity_type}]")
+            
+            # Собираем финальный текст
+            result_text = ''.join(result_parts)
+            
+            # Очищаем финальный текст от лишних пробелов
+            result_text = self.clean_text(result_text)
             
             # Если результат пустой, возвращаем исходный текст
             if not result_text.strip():
@@ -113,7 +136,7 @@ class EntityReplacer:
             print(f"Детали ошибки: {traceback.format_exc()}")
             return text
 
-def process_json_file(input_file, model_path, output_file):
+def process_json_file(input_file, model_path, output_file, include_roles=False):
     """Обработка JSON файла и замена сущностей с объединением сообщений"""
     print(f"Загрузка данных из {input_file}...")
     
@@ -150,30 +173,44 @@ def process_json_file(input_file, model_path, output_file):
     
     for dialog in tqdm(data, desc="Обработка диалогов"):
         # Объединяем все сообщения диалога в один текст
-        all_messages_text = ""
+        all_messages_parts = []
         
         # Обработка каждого сообщения в диалоге
         for message in dialog['dialogue']:
             stats['total_messages'] += 1
             original_text = message['text']
+            role = message.get('role', 'unknown')
             
-            # Обрабатываем переносы строк - заменяем на пробелы для лучшей читаемости
+            # Обрабатываем переносы строк - заменяем на пробелы
             cleaned_text = original_text.replace('\n', ' ').replace('\r', ' ')
             
             # Замена сущностей в тексте
             processed_text = replacer.replace_entities_in_text(cleaned_text)
             
-            # Добавляем к общему тексту диалога
-            if all_messages_text:
-                all_messages_text += " " + processed_text
+            # Формируем часть сообщения
+            if include_roles:
+                message_part = f"{role}: {processed_text}"
             else:
-                all_messages_text = processed_text
+                message_part = processed_text
+            
+            all_messages_parts.append(message_part)
             
             # Считаем количество найденных сущностей
             entities_count = len(re.findall(r'\[[A-Z_]+\]', processed_text))
             if entities_count > 0:
                 stats['entities_found'] += entities_count
                 stats['processed_messages'] += 1
+        
+        # Объединяем все части в единый текст
+        if include_roles:
+            # При включении ролей разделяем сообщения точками для лучшей читаемости
+            all_messages_text = ". ".join(all_messages_parts) + "."
+        else:
+            # Без ролей просто объединяем через пробел
+            all_messages_text = " ".join(all_messages_parts)
+        
+        # Очищаем финальный текст
+        all_messages_text = replacer.clean_text(all_messages_text)
         
         # Создаем новый объект диалога с объединенным текстом
         processed_dialog = {
@@ -182,9 +219,10 @@ def process_json_file(input_file, model_path, output_file):
             'metadata': dialog.get('metadata', {}),
             'original_topic': dialog.get('topic', 'unknown'),
             'source': dialog.get('source', 'unknown'),
-            'text': all_messages_text.strip(),
+            'text': all_messages_text,
             'message_count': len(dialog['dialogue']),
-            'text_length': len(all_messages_text.strip())
+            'text_length': len(all_messages_text),
+            'include_roles': include_roles
         }
         
         processed_data.append(processed_dialog)
@@ -202,6 +240,7 @@ def process_json_file(input_file, model_path, output_file):
         print(f"  Всего найденных сущностей: {stats['entities_found']}")
         if stats['total_messages'] > 0:
             print(f"  Процент обработанных сообщений: {(stats['processed_messages']/stats['total_messages'])*100:.1f}%")
+        print(f"  Включены роли в текст: {'да' if include_roles else 'нет'}")
         
     except Exception as e:
         print(f"Ошибка сохранения файла: {e}")
@@ -216,18 +255,20 @@ def main():
     INPUT_FILE = "data/dialogs.json"  # Путь к исходному JSON файлу с диалогами
     MODEL_PATH = "models/ner_model"   # Путь к NER модели
     OUTPUT_FILE = "data/preprocessed_dialogs.json"  # Путь для сохранения обработанных данных
+    INCLUDE_ROLES = True  # Включать ли роли в объединенный текст (True/False)
     
     print("Запуск предобработки данных...")
     print(f"Входной файл: {INPUT_FILE}")
     print(f"Модель: {MODEL_PATH}")
     print(f"Выходной файл: {OUTPUT_FILE}")
+    print(f"Включение ролей в текст: {'да' if INCLUDE_ROLES else 'нет'}")
     print("=" * 60)
     
     # Создаем папку для выходного файла если не существует
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
     
     # Запуск обработки
-    process_json_file(INPUT_FILE, MODEL_PATH, OUTPUT_FILE)
+    process_json_file(INPUT_FILE, MODEL_PATH, OUTPUT_FILE, INCLUDE_ROLES)
     
     print("Предобработка завершена!")
 
