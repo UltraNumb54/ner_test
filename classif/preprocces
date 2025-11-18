@@ -21,7 +21,6 @@ class EntityReplacer:
         try:
             with open(f'{model_path}/label_mapping.json', 'r', encoding='utf-8') as f:
                 label_mapping = json.load(f)
-                # Преобразуем ключи в строки для совместимости
                 self.id2label = {str(k): v for k, v in label_mapping['id2label'].items()}
             print("Загружен пользовательский маппинг меток")
         except:
@@ -30,16 +29,12 @@ class EntityReplacer:
             print("Используется стандартный маппинг меток модели")
     
     def clean_text(self, text):
-        """Очистка текста от лишних пробелов и специальных символов"""
+        """Очистка текста от лишних пробелов"""
         if not text:
             return ""
         
-        # Заменяем множественные пробелы на один
-        text = re.sub(r'\s+', ' ', text)
-        
-        # Убираем специальные символы, которые могут мешать (опционально)
-        # Можно раскомментировать при необходимости
-        # text = re.sub(r'[^\w\s\[\],.!?;:-]', '', text)
+        # Заменяем множественные пробелы на один, но сохраняем структуру
+        text = re.sub(r' +', ' ', text)
         
         return text.strip()
     
@@ -52,18 +47,20 @@ class EntityReplacer:
             # Очищаем текст перед обработкой
             text = self.clean_text(text)
             
-            # Токенизация текста
+            # Токенизация текста с возвращением смещений
             inputs = self.tokenizer(
                 text,
                 padding=True,
                 truncation=True,
                 max_length=512,
                 return_tensors="pt",
-                return_offsets_mapping=True
+                return_offsets_mapping=True,
+                return_special_tokens_mask=True
             )
             
-            # Убираем offset_mapping из inputs для модели
+            # Извлекаем смещения и маску специальных токенов
             offset_mapping = inputs.pop('offset_mapping')
+            special_tokens_mask = inputs.pop('special_tokens_mask')
             
             # Переносим на устройство
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -75,48 +72,57 @@ class EntityReplacer:
             
             # Получаем предсказания для первого примера в батче
             predictions = predictions[0].cpu().numpy()
-            tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
             offsets = offset_mapping[0].cpu().numpy()
+            special_tokens = special_tokens_mask[0].cpu().numpy()
             
-            # Обрабатываем результаты с сохранением пробелов
+            # Собираем результат с сохранением пробелов
             result_parts = []
             current_entity = None
-            current_entity_type = None
+            last_end = 0
             
-            for i, (token, pred, (start, end)) in enumerate(zip(tokens, predictions, offsets)):
-                if token in [self.tokenizer.cls_token, self.tokenizer.sep_token, self.tokenizer.pad_token]:
+            for i, (pred, (start, end), is_special) in enumerate(zip(predictions, offsets, special_tokens)):
+                if is_special:
                     continue
                 
                 # Преобразуем предсказание в int для совместимости
                 pred_int = int(pred)
                 label = self.id2label.get(str(pred_int), 'O')
                 
+                # Добавляем текст до текущего токена
+                if start > last_end:
+                    result_parts.append(text[last_end:start])
+                
                 # Обрабатываем сущности
                 if label.startswith('B-'):
                     # Начало новой сущности
                     if current_entity is not None:
-                        # Сохраняем предыдущую сущность
-                        result_parts.append(f"[{current_entity_type}]")
-                    current_entity = []
-                    current_entity_type = label[2:]
-                elif label.startswith('I-') and current_entity is not None and current_entity_type == label[2:]:
-                    # Продолжение сущности
+                        result_parts.append(f"[{current_entity}]")
+                    current_entity = label[2:]
+                elif label.startswith('I-') and current_entity is not None and current_entity == label[2:]:
+                    # Продолжение сущности - ничего не делаем
                     pass
-                elif label == 'O':
+                elif label == 'O' and current_entity is not None:
+                    # Конец сущности
+                    result_parts.append(f"[{current_entity}]")
+                    current_entity = None
+                    # Добавляем текущий токен
+                    result_parts.append(text[start:end])
+                else:
                     # Не сущность
                     if current_entity is not None:
-                        # Завершаем текущую сущность
-                        result_parts.append(f"[{current_entity_type}]")
+                        result_parts.append(f"[{current_entity}]")
                         current_entity = None
-                        current_entity_type = None
-                    
-                    # Добавляем обычный текст с пробелами
-                    if start < end:
-                        result_parts.append(text[start:end])
+                    result_parts.append(text[start:end])
+                
+                last_end = end
             
             # Добавляем последнюю сущность если есть
             if current_entity is not None:
-                result_parts.append(f"[{current_entity_type}]")
+                result_parts.append(f"[{current_entity}]")
+            
+            # Добавляем оставшийся текст
+            if last_end < len(text):
+                result_parts.append(text[last_end:])
             
             # Собираем финальный текст
             result_text = ''.join(result_parts)
