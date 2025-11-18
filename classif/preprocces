@@ -1,0 +1,266 @@
+# preprocess_entities.py
+import json
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+import re
+from tqdm import tqdm
+import os
+
+class EntityReplacer:
+    def __init__(self, model_path):
+        """Инициализация NER модели для замены сущностей"""
+        print(f"Загрузка NER модели из {model_path}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForTokenClassification.from_pretrained(model_path)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Используется устройство: {self.device}")
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Загрузка маппинга меток
+        try:
+            with open(f'{model_path}/label_mapping.json', 'r', encoding='utf-8') as f:
+                label_mapping = json.load(f)
+                self.id2label = label_mapping['id2label']
+            print("Загружен пользовательский маппинг меток")
+        except:
+            # Используем стандартный маппинг модели
+            self.id2label = self.model.config.id2label
+            print("Используется стандартный маппинг меток модели")
+    
+    def replace_entities_in_text(self, text):
+        """Замена сущностей на метки в тексте"""
+        if not text or len(text.strip()) == 0:
+            return text
+        
+        try:
+            # Токенизация текста на предложения или части для обработки
+            # Разбиваем текст на части, если он слишком длинный
+            max_length = 510  # Оставляем место для специальных токенов
+            text_parts = []
+            if len(text) > max_length:
+                # Простое разбиение по предложениям или пробелам
+                sentences = re.split(r'(?<=[.!?])\s+', text)
+                current_part = ""
+                for sentence in sentences:
+                    if len(current_part) + len(sentence) <= max_length:
+                        current_part += sentence + " "
+                    else:
+                        if current_part:
+                            text_parts.append(current_part.strip())
+                        current_part = sentence + " "
+                if current_part:
+                    text_parts.append(current_part.strip())
+            else:
+                text_parts = [text]
+            
+            result_parts = []
+            
+            for part in text_parts:
+                # Токенизация части текста
+                inputs = self.tokenizer(
+                    part,
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt",
+                    return_offsets_mapping=True
+                )
+                
+                # Сохраняем offset_mapping отдельно
+                offset_mapping = inputs['offset_mapping']
+                
+                # Убираем offset_mapping из inputs для модели
+                model_inputs = {
+                    'input_ids': inputs['input_ids'],
+                    'attention_mask': inputs['attention_mask']
+                }
+                
+                # Переносим на устройство
+                model_inputs = {k: v.to(self.device) for k, v in model_inputs.items()}
+                
+                # Предсказание
+                with torch.no_grad():
+                    outputs = self.model(**model_inputs)
+                    predictions = torch.argmax(outputs.logits, dim=2)
+                
+                # Получаем предсказания для первого примера в батче
+                predictions = predictions[0].cpu().numpy()
+                tokens = self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0])
+                offsets = offset_mapping[0].cpu().numpy()
+                
+                # Обрабатываем результаты
+                result_text = ""
+                current_entity = None
+                entity_start = -1
+                
+                for i, (token, pred, (start, end)) in enumerate(zip(tokens, predictions, offsets)):
+                    if token in [self.tokenizer.cls_token, self.tokenizer.sep_token, self.tokenizer.pad_token]:
+                        continue
+                    
+                    label = self.id2label[pred]
+                    
+                    # Обрабатываем сущности
+                    if label.startswith('B-'):
+                        # Начало новой сущности
+                        if current_entity is not None:
+                            result_text += f"[{current_entity}]"
+                        current_entity = label[2:]  # Убираем B-
+                        entity_start = start
+                    elif label.startswith('I-') and current_entity is not None and current_entity == label[2:]:
+                        # Продолжение сущности - ничего не делаем
+                        pass
+                    elif label == 'O' and current_entity is not None:
+                        # Конец сущности
+                        result_text += f"[{current_entity}]"
+                        current_entity = None
+                        # Добавляем текущий токен
+                        if start < end:
+                            result_text += part[start:end]
+                    else:
+                        # Не сущность
+                        if current_entity is not None:
+                            result_text += f"[{current_entity}]"
+                            current_entity = None
+                        if start < end:
+                            result_text += part[start:end]
+                
+                # Добавляем последнюю сущность если есть
+                if current_entity is not None:
+                    result_text += f"[{current_entity}]"
+                
+                result_parts.append(result_text)
+            
+            # Объединяем все части
+            final_result = " ".join(result_parts)
+            
+            # Если результат пустой, возвращаем исходный текст
+            if not final_result.strip():
+                return text
+                
+            return final_result
+            
+        except Exception as e:
+            print(f"Ошибка при обработке текста: {e}")
+            return text
+
+def process_json_file(input_file, model_path, output_file):
+    """Обработка JSON файла и замена сущностей с объединением сообщений"""
+    print(f"Загрузка данных из {input_file}...")
+    
+    # Проверка существования файлов
+    if not os.path.exists(input_file):
+        print(f"Ошибка: Файл {input_file} не существует")
+        return
+    
+    if not os.path.exists(model_path):
+        print(f"Ошибка: Модель {model_path} не существует")
+        return
+    
+    # Загрузка исходного JSON
+    try:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Ошибка загрузки JSON: {e}")
+        return
+    
+    print(f"Загружено диалогов: {len(data)}")
+    
+    # Инициализация заменщика сущностей
+    replacer = EntityReplacer(model_path)
+    
+    # Обработка каждого диалога
+    processed_data = []
+    stats = {
+        'total_dialogs': len(data),
+        'total_messages': 0,
+        'processed_messages': 0,
+        'entities_found': 0
+    }
+    
+    for dialog in tqdm(data, desc="Обработка диалогов"):
+        # Объединяем все сообщения диалога в один текст
+        all_messages_text = ""
+        
+        # Обработка каждого сообщения в диалоге
+        for message in dialog['dialogue']:
+            stats['total_messages'] += 1
+            original_text = message['text']
+            
+            # Обрабатываем переносы строк - заменяем на пробелы для лучшей читаемости
+            cleaned_text = original_text.replace('\n', ' ').replace('\r', ' ')
+            
+            # Замена сущностей в тексте
+            processed_text = replacer.replace_entities_in_text(cleaned_text)
+            
+            # Добавляем к общему тексту диалога
+            if all_messages_text:
+                all_messages_text += " " + processed_text
+            else:
+                all_messages_text = processed_text
+            
+            # Считаем количество найденных сущностей
+            entities_count = len(re.findall(r'\[[A-Z_]+\]', processed_text))
+            if entities_count > 0:
+                stats['entities_found'] += entities_count
+                stats['processed_messages'] += 1
+        
+        # Создаем новый объект диалога с объединенным текстом
+        processed_dialog = {
+            'id': dialog['id'],
+            'timestamp': dialog.get('timestamp', ''),
+            'metadata': dialog.get('metadata', {}),
+            'original_topic': dialog.get('topic', 'unknown'),
+            'source': dialog.get('source', 'unknown'),
+            'text': all_messages_text.strip(),
+            'message_count': len(dialog['dialogue']),
+            'text_length': len(all_messages_text.strip())
+        }
+        
+        processed_data.append(processed_dialog)
+    
+    # Сохранение результата
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(processed_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"Обработанные данные сохранены в {output_file}")
+        print(f"Статистика обработки:")
+        print(f"  Всего диалогов: {stats['total_dialogs']}")
+        print(f"  Всего сообщений: {stats['total_messages']}")
+        print(f"  Сообщений с сущностями: {stats['processed_messages']}")
+        print(f"  Всего найденных сущностей: {stats['entities_found']}")
+        if stats['total_messages'] > 0:
+            print(f"  Процент обработанных сообщений: {(stats['processed_messages']/stats['total_messages'])*100:.1f}%")
+        
+    except Exception as e:
+        print(f"Ошибка сохранения файла: {e}")
+    
+    return processed_data
+
+def main():
+    """Основная функция с путями в коде"""
+    
+    # УКАЖИТЕ ВАШИ ПУТИ К ФАЙЛАМ ЗДЕСЬ:
+    
+    INPUT_FILE = "data/dialogs.json"  # Путь к исходному JSON файлу с диалогами
+    MODEL_PATH = "models/ner_model"   # Путь к NER модели
+    OUTPUT_FILE = "data/preprocessed_dialogs.json"  # Путь для сохранения обработанных данных
+    
+    print("Запуск предобработки данных...")
+    print(f"Входной файл: {INPUT_FILE}")
+    print(f"Модель: {MODEL_PATH}")
+    print(f"Выходной файл: {OUTPUT_FILE}")
+    print("=" * 60)
+    
+    # Создаем папку для выходного файла если не существует
+    os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
+    
+    # Запуск обработки
+    process_json_file(INPUT_FILE, MODEL_PATH, OUTPUT_FILE)
+    
+    print("Предобработка завершена!")
+
+if __name__ == "__main__":
+    main()
