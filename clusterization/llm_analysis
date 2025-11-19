@@ -1,0 +1,57 @@
+# test_metka_translation.py
+import re
+
+def test_metka_translation():
+    """
+    Тестирование перевода и объединения меток
+    """
+    # Словарь переводов
+    metka_translations = {
+        '[FIO]': '[ФИО]',
+        '[PHONE]': '[Телефон]',
+        '[PHONE_NUM]': '[Телефон]',
+        '[EMAIL]': '[Email]',
+        '[DATE]': '[Дата]',
+        '[SUM]': '[Сумма]',
+        '[ORG]': '[Организация]',
+        '[LOC]': '[Адрес]',
+        '[READINGS]': '[Показания]',
+        '[LK_NUM]': '[Номер лицевого счёта]'
+    }
+    
+    def translate_and_merge_metkas(text):
+        # Заменяем английские метки на русские
+        for eng_metka, rus_metka in metka_translations.items():
+            text = text.replace(eng_metka, rus_metka)
+        
+        # Объединяем подряд идущие одинаковые русские метки
+        for rus_metka in metka_translations.values():
+            pattern = f'({re.escape(rus_metka)}\\s*)+'
+            text = re.sub(pattern, rus_metka + ' ', text)
+        
+        # Убираем лишние пробелы
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+    
+    # Тестовые примеры
+    test_cases = [
+        "Привет [FIO] [FIO] как дела?",
+        "Мой телефон [PHONE] [PHONE_NUM] [PHONE]",
+        "Дата [DATE] сумма [SUM] [SUM] [SUM]",
+        "[ORG] [LOC] [EMAIL] [LK_NUM]",
+        "[FIO] [FIO] [FIO] [PHONE] [PHONE]"
+    ]
+    
+    print("Тестирование перевода и объединения меток:")
+    print("=" * 50)
+    
+    for i, test in enumerate(test_cases, 1):
+        result = translate_and_merge_metkas(test)
+        print(f"Пример {i}:")
+        print(f"  До:   '{test}'")
+        print(f"  После: '{result}'")
+        print()
+
+if __name__ == "__main__":
+    test_metka_translation()
