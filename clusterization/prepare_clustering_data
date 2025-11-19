@@ -1,17 +1,238 @@
-# prepare_clustering_data.py
+# preprocess_with_ner_model.py
 import json
+import os
 import re
 import pandas as pd
 from collections import defaultdict
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification
 
-def create_clustering_files(input_file, output_analysis, output_clustering, output_first_messages):
-    """
-    Создает три файла для кластеризации:
-    1. Файл анализа с текстом до и после замен
-    2. Файл для кластеризации с замененными метками
-    3. Файл с первыми сообщениями диалогов
-    """
+class NERReplacer:
+    def __init__(self, model_path):
+        """
+        Инициализация NER модели для замены сущностей
+        """
+        print(f"Загрузка NER модели из {model_path}...")
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForTokenClassification.from_pretrained(model_path)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Загрузка маппинга меток
+        with open(f'{model_path}/label_mapping.json', 'r', encoding='utf-8') as f:
+            label_mapping = json.load(f)
+            self.id2label = label_mapping['id2label']
+        
+        # Словарь для замены английских меток на русские
+        self.metka_translations = {
+            'B-FIO': '[ФИО]', 'I-FIO': '[ФИО]',
+            'B-PHONE_NUM': '[Телефон]', 'I-PHONE_NUM': '[Телефон]',
+            'B-EMAIL': '[Email]', 'I-EMAIL': '[Email]',
+            'B-DATE': '[Дата]', 'I-DATE': '[Дата]',
+            'B-SUM': '[Сумма]', 'I-SUM': '[Сумма]',
+            'B-ORG': '[Организация]', 'I-ORG': '[Организация]',
+            'B-LOC': '[Адрес]', 'I-LOC': '[Адрес]',
+            'B-READINGS': '[Показания]', 'I-READINGS': '[Показания]',
+            'B-LK_NUM': '[Номер лицевого счёта]', 'I-LK_NUM': '[Номер лицевого счёта]'
+        }
+        
+        print("NER модель загружена успешно!")
     
+    def predict_entities(self, text):
+        """
+        Предсказание сущностей в тексте с помощью NER модели
+        """
+        if not text or not text.strip():
+            return []
+        
+        # Токенизация текста на слова
+        words = self.smart_tokenize(text)
+        
+        if not words:
+            return []
+        
+        # Токенизация для модели
+        encoding = self.tokenizer(
+            words,
+            is_split_into_words=True,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt",
+            return_offsets_mapping=True
+        )
+        
+        # Предсказание
+        with torch.no_grad():
+            inputs = {k: v.to(self.device) for k, v in encoding.items()}
+            outputs = self.model(**inputs)
+            predictions = torch.argmax(outputs.logits, dim=2)
+        
+        # Обработка результатов
+        entities = self._process_predictions(words, encoding, predictions)
+        return entities
+    
+    def smart_tokenize(self, text):
+        """
+        Умная токенизация текста
+        """
+        if not text or not text.strip():
+            return []
+        
+        tokens = []
+        current_token = ""
+        
+        for char in text:
+            if char.isalnum() or char in ['-', '_', '@', '.', '+', '/', '\\']:
+                current_token += char
+            else:
+                if current_token:
+                    tokens.append(current_token)
+                    current_token = ""
+                if char.strip():
+                    tokens.append(char)
+        
+        if current_token:
+            tokens.append(current_token)
+            
+        return tokens
+    
+    def _process_predictions(self, original_tokens, encoding, predictions):
+        """
+        Обработка предсказаний модели
+        """
+        entities = []
+        word_ids = encoding.word_ids(batch_index=0)
+        
+        current_entity = ""
+        current_entity_type = None
+        current_entity_start = None
+        
+        for i, (word_id, pred_id) in enumerate(zip(word_ids, predictions[0])):
+            if word_id is None:
+                continue
+            
+            if encoding['input_ids'][0][i] == self.tokenizer.pad_token_id:
+                continue
+            
+            token = original_tokens[word_id] if word_id < len(original_tokens) else ""
+            pred_str = str(pred_id.item())
+            label = self.id2label.get(pred_str, 'O')
+            
+            # Если это начало новой сущности
+            if label.startswith('B-') or (label != 'O' and current_entity_type != self.metka_translations.get(label, label)):
+                # Сохраняем предыдущую сущность если есть
+                if current_entity:
+                    entities.append({
+                        'text': current_entity.strip(),
+                        'type': current_entity_type,
+                        'start_pos': current_entity_start,
+                        'end_pos': i
+                    })
+                
+                # Начинаем новую сущность
+                current_entity = token
+                current_entity_type = self.metka_translations.get(label, label)
+                current_entity_start = i
+            
+            # Если продолжаем текущую сущность
+            elif label != 'O' and current_entity_type == self.metka_translations.get(label, label):
+                # Добавляем к текущей сущности
+                if token.strip() and not token.startswith(('.', ',', '!', '?', ':', ';')):
+                    current_entity += " " + token
+                else:
+                    current_entity += token
+            
+            # Если сущность закончилась
+            elif label == 'O' and current_entity:
+                entities.append({
+                    'text': current_entity.strip(),
+                    'type': current_entity_type,
+                    'start_pos': current_entity_start,
+                    'end_pos': i
+                })
+                current_entity = ""
+                current_entity_type = None
+        
+        # Добавляем последнюю сущность если есть
+        if current_entity:
+            entities.append({
+                'text': current_entity.strip(),
+                'type': current_entity_type,
+                'start_pos': current_entity_start,
+                'end_pos': len(word_ids)
+            })
+        
+        return entities
+    
+    def replace_entities_in_text(self, text):
+        """
+        Замена сущностей в тексте на русские метки с объединением подряд идущих
+        """
+        entities = self.predict_entities(text)
+        
+        if not entities:
+            return text, []
+        
+        # Сортируем сущности по позиции начала
+        entities.sort(key=lambda x: x['start_pos'])
+        
+        # Заменяем сущности в тексте
+        result_text = text
+        replacements = []
+        offset = 0
+        
+        for entity in entities:
+            original_text = entity['text']
+            replacement = entity['type']
+            
+            # Находим позицию в тексте с учетом предыдущих замен
+            pos = result_text.find(original_text, offset)
+            if pos != -1:
+                # Заменяем текст
+                result_text = result_text[:pos] + replacement + result_text[pos + len(original_text):]
+                
+                replacements.append({
+                    'original': original_text,
+                    'replacement': replacement,
+                    'position': pos
+                })
+                
+                # Обновляем offset для следующего поиска
+                offset = pos + len(replacement)
+        
+        # Объединяем подряд идущие одинаковые метки
+        result_text = self.merge_consecutive_metkas(result_text)
+        
+        return result_text, replacements
+    
+    def merge_consecutive_metkas(self, text):
+        """
+        Объединяет подряд идущие одинаковые метки в одну
+        """
+        # Все возможные метки
+        metkas = [
+            '[ФИО]', '[Телефон]', '[Email]', '[Дата]', '[Сумма]', 
+            '[Организация]', '[Адрес]', '[Показания]', '[Номер лицевого счёта]'
+        ]
+        
+        for metka in metkas:
+            # Регулярное выражение для поиска 2+ подряд идущих одинаковых меток
+            pattern = f'({re.escape(metka)}\\s*)+'
+            # Заменяем на одну метку
+            text = re.sub(pattern, metka + ' ', text)
+        
+        # Убираем лишние пробелы
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+
+def create_three_files_with_ner(input_file, output_analysis, output_clustering, output_first_messages, model_path):
+    """
+    Создает три файла с использованием NER модели для замен сущностей
+    """
     print(f"Чтение файла: {input_file}")
     
     with open(input_file, 'r', encoding='utf-8') as f:
@@ -19,62 +240,13 @@ def create_clustering_files(input_file, output_analysis, output_clustering, outp
     
     print(f"Обработка {len(data)} диалогов...")
     
+    # Инициализация NER заменщика
+    ner_replacer = NERReplacer(model_path)
+    
     # Списки для трех файлов
     analysis_data = []      # Для анализа: текст до/после замен
     clustering_data = []    # Для кластеризации: только текст с заменами
-    first_messages_data = [] # Только первые сообщения
-    
-    # Словарь замен (пример - нужно адаптировать под ваши метки)
-    replacement_patterns = {
-        # ФИО
-        r'\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)?\b': '[FIO]',
-        
-        # Телефоны
-        r'\b\d{3}[-.]?\d{3}[-.]?\d{2}[-.]?\d{2}\b': '[PHONE]',
-        r'\b\+7\s?\(\d{3}\)\s?\d{3}[-.]?\d{2}[-.]?\d{2}\b': '[PHONE]',
-        
-        # Email
-        r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b': '[EMAIL]',
-        
-        # Даты
-        r'\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b': '[DATE]',
-        r'\b\d{4}[-.]?\d{2}[-.]?\d{2}\b': '[DATE]',
-        
-        # Суммы
-        r'\b\d+[.,]?\d*\s*(?:руб|р|USD|EUR|€|\$)\b': '[SUM]',
-        
-        # Организации (простые паттерны)
-        r'\b(?:ООО|ЗАО|АО|ИП|ПАО)\s+["«]?[А-Яа-яЁё\w\s]+["»]?\b': '[ORG]',
-        
-        # ЛК номера (пример)
-        r'\b\d{10,20}\b': '[LK_NUM]',
-        
-        # Адреса (простые паттерны)
-        r'\bг\.\s*[А-ЯЁ][а-яё-]+\b': '[LOC]',
-        r'\bул\.\s*[А-ЯЁ][а-яё-]+\b': '[LOC]',
-        r'\bд\.\s*\d+\b': '[LOC]',
-        
-        # Показания счетчиков
-        r'\b\d{1,5}[.,]\d{1,3}\s*(?:кВт|квт|м3|м³|Гкал)\b': '[READINGS]',
-    }
-    
-    def apply_replacements(text):
-        """Применяет замены к тексту"""
-        original_text = text
-        replacements = []
-        
-        for pattern, replacement in replacement_patterns.items():
-            matches = re.finditer(pattern, text, re.IGNORECASE)
-            for match in matches:
-                original_value = match.group()
-                replacements.append({
-                    'original': original_value,
-                    'replacement': replacement,
-                    'pattern': pattern
-                })
-                text = text.replace(original_value, replacement)
-        
-        return text, replacements
+    first_messages_data = [] # Только первые сообщения (без замен)
     
     for dialog in data:
         dialog_id = dialog.get('id', 'unknown')
@@ -93,8 +265,8 @@ def create_clustering_files(input_file, output_analysis, output_clustering, outp
                     text = message['text'].strip()
                     all_texts_original.append(text)
                     
-                    # Применяем замены
-                    replaced_text, replacements = apply_replacements(text)
+                    # Применяем замены с помощью NER модели
+                    replaced_text, replacements = ner_replacer.replace_entities_in_text(text)
                     all_texts_replaced.append(replaced_text)
                     all_replacements.extend(replacements)
                     
@@ -106,14 +278,17 @@ def create_clustering_files(input_file, output_analysis, output_clustering, outp
         
         # 1. Файл для анализа
         if all_texts_original:
+            full_text_original = ' '.join(all_texts_original)
+            full_text_replaced = ' '.join(all_texts_replaced)
+            
             analysis_data.append({
                 'dialog_id': dialog_id,
                 'topic': topic,
                 'source': source,
                 'messages': all_messages,
                 'replacements': all_replacements,
-                'full_text_original': ' '.join(all_texts_original),
-                'full_text_replaced': ' '.join(all_texts_replaced)
+                'full_text_original': full_text_original,
+                'full_text_replaced': full_text_replaced
             })
         
         # 2. Файл для кластеризации
@@ -126,13 +301,13 @@ def create_clustering_files(input_file, output_analysis, output_clustering, outp
                 'text_length': len(' '.join(all_texts_replaced))
             })
         
-        # 3. Файл с первыми сообщениями
+        # 3. Файл с первыми сообщениями (БЕЗ ЗАМЕН)
         if all_texts_original:
             first_messages_data.append({
                 'dialog_id': dialog_id,
                 'topic': topic,
                 'source': source,
-                'first_message': all_texts_original[0],
+                'first_message': all_texts_original[0],  # Исходный текст без замен
                 'first_message_length': len(all_texts_original[0])
             })
     
@@ -175,76 +350,81 @@ def create_clustering_files(input_file, output_analysis, output_clustering, outp
         print("  Распределение замен:")
         for replacement_type, count in sorted(replacement_stats.items(), key=lambda x: x[1], reverse=True):
             print(f"    {replacement_type}: {count}")
+    
+    return analysis_data, clustering_data, first_messages_data
 
-def test_replacements():
-    """Тестирование замен на примерах"""
+def test_ner_replacements(ner_replacer):
+    """
+    Тестирование замен с помощью NER модели
+    """
     test_cases = [
-        "Меня зовут Иван Иванов, мой телефон +79161234567",
-        "Стоимость 1500 руб, дата 15.12.2023",
-        "Email: test@example.com, ЛК номер 1234567890",
-        "ООО Ромашка, г. Москва, ул. Ленина д.5",
-        "Показания 125.5 кВт, сумма к оплате 2500.75 руб"
+        "Меня зовут Иван Иванов, телефон +79161234567",
+        "Стоимость 1500 рублей, дата 15.12.2023",
+        "Email: test@example.com, номер счета 1234567890",
+        "ООО Ромашка, город Москва, улица Ленина дом 5",
+        "Показания 125.5 кВт, сумма 2500.75 руб"
     ]
     
-    print("Тестирование замен:")
+    print("\nТестирование NER замен:")
+    print("=" * 50)
     
-    # Упрощенные паттерны для теста
-    test_patterns = {
-        r'\b[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\b': '[FIO]',
-        r'\b\d{3}[-.]?\d{3}[-.]?\d{2}[-.]?\d{2}\b': '[PHONE]',
-        r'\b\d+[.,]?\d*\s*руб\b': '[SUM]',
-        r'\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b': '[DATE]',
-        r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b': '[EMAIL]',
-        r'\b\d{10,20}\b': '[LK_NUM]',
-        r'\bООО\s+[А-Яа-яЁё\w\s]+\b': '[ORG]',
-        r'\bг\.\s*[А-ЯЁ][а-яё-]+\b': '[LOC]',
-        r'\bул\.\s*[А-ЯЁ][а-яё-]+\b': '[LOC]',
-        r'\b\d+[.,]\d+\s*кВт\b': '[READINGS]',
-    }
-    
-    def test_apply_replacements(text):
-        for pattern, replacement in test_patterns.items():
-            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-        return text
-    
-    for test in test_cases:
-        result = test_apply_replacements(test)
-        print(f"  '{test}'")
-        print(f"  -> '{result}'\n")
+    for i, test in enumerate(test_cases, 1):
+        replaced, replacements = ner_replacer.replace_entities_in_text(test)
+        print(f"Пример {i}:")
+        print(f"  Оригинал: '{test}'")
+        print(f"  Заменено: '{replaced}'")
+        if replacements:
+            print(f"  Замены: {replacements}")
+        print()
 
 def main():
     """
     Основная функция
     """
     # ==================== КОНФИГУРАЦИЯ ====================
-    INPUT_FILE = "input_data.json"              # Исходный JSON файл
-    OUTPUT_ANALYSIS = "analysis_data.json"      # Файл для анализа
-    OUTPUT_CLUSTERING = "clustering_data.json"  # Файл для кластеризации  
-    OUTPUT_FIRST_MESSAGES = "first_messages.json" # Файл с первыми сообщениями
-    RUN_TESTS = True                           # Запустить тесты замен
+    INPUT_FILE = "input_data.json"                  # Исходный JSON файл
+    OUTPUT_ANALYSIS = "analysis_data_ner.json"      # Файл для анализа
+    OUTPUT_CLUSTERING = "clustering_data_ner.json"  # Файл для кластеризации  
+    OUTPUT_FIRST_MESSAGES = "first_messages.json"   # Файл с первыми сообщениями (без замен)
+    NER_MODEL_PATH = "ner-final-model"              # Путь к дообученной NER модели
+    TEST_NER = True                                # Протестировать NER замены
     # ======================================================
     
-    if RUN_TESTS:
-        print("=" * 60)
-        print("ТЕСТИРОВАНИЕ ЗАМЕН")
-        print("=" * 60)
-        test_replacements()
-        print("=" * 60 + "\n")
+    print("=" * 60)
+    print("ПРЕДОБРАБОТКА С ИСПОЛЬЗОВАНИЕМ NER МОДЕЛИ")
+    print("=" * 60)
+    
+    if not os.path.exists(INPUT_FILE):
+        print(f"Ошибка: файл {INPUT_FILE} не найден!")
+        return
+    
+    if not os.path.exists(NER_MODEL_PATH):
+        print(f"Ошибка: NER модель {NER_MODEL_PATH} не найдена!")
+        return
     
     try:
-        create_clustering_files(
+        # Тестирование NER замен
+        if TEST_NER:
+            ner_replacer = NERReplacer(NER_MODEL_PATH)
+            test_ner_replacements(ner_replacer)
+        
+        # Создание трех файлов
+        analysis, clustering, first_messages = create_three_files_with_ner(
             INPUT_FILE, 
             OUTPUT_ANALYSIS, 
             OUTPUT_CLUSTERING, 
-            OUTPUT_FIRST_MESSAGES
+            OUTPUT_FIRST_MESSAGES,
+            NER_MODEL_PATH
         )
+        
         print("\n" + "=" * 60)
-        print("ПОДГОТОВКА ДАННЫХ ДЛЯ КЛАСТЕРИЗАЦИИ ЗАВЕРШЕНА!")
+        print("ПРЕДОБРАБОТКА ЗАВЕРШЕНА!")
         print("=" * 60)
-    except FileNotFoundError:
-        print(f"Ошибка: файл {INPUT_FILE} не найден!")
+        
     except Exception as e:
         print(f"Ошибка при обработке: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
