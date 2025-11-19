@@ -3,7 +3,6 @@ let csvData = [];
 let currentRowIndex = 0;
 let selectedTokens = [];
 let currentFile = null;
-let originalHeaders = [];
 
 // Загрузка файла
 document.getElementById('loadBtn').addEventListener('click', function() {
@@ -44,40 +43,49 @@ function parseCSV(csvText) {
     }
     
     // Парсим заголовки
-    originalHeaders = parseCSVLine(lines[0]);
-    console.log('Обнаружены заголовки:', originalHeaders);
+    const headers = parseCSVLine(lines[0]);
+    console.log('Обнаружены заголовки:', headers);
     
     csvData = [];
-    let fixedRows = 0;
-    let skippedRows = 0;
     
-    // Обрабатываем строки данных
     for (let i = 1; i < lines.length; i++) {
         try {
             const values = parseCSVLine(lines[i]);
             
-            if (values.length === 0) {
-                skippedRows++;
-                continue;
-            }
+            if (values.length === 0) continue;
             
-            const row = createDataRow(values, originalHeaders);
-            const normalizationResult = normalizeRowData(row);
+            const row = {};
             
-            if (normalizationResult.valid) {
-                if (normalizationResult.fixed) {
-                    fixedRows++;
-                    row.autoFixed = true;
+            // Заполняем данные из значений
+            for (let j = 0; j < Math.min(headers.length, values.length); j++) {
+                const header = headers[j];
+                let value = values[j];
+                
+                // Обработка специальных полей
+                if (header === 'tokens' || header === 'ner_tags') {
+                    value = parseArrayField(value);
+                } else if (header === 'success') {
+                    value = parseBooleanField(value);
                 }
-                csvData.push(row);
-            } else {
-                skippedRows++;
-                console.warn(`Строка ${i} пропущена из-за некорректных данных:`, values);
+                
+                row[header] = value;
             }
+            
+            // Обеспечиваем наличие всех обязательных полей
+            if (!row.dialog_id) row.dialog_id = `auto-${i}`;
+            if (!row.dialog_message_index) row.dialog_message_index = '1';
+            if (!row.original_text) row.original_text = '';
+            if (!row.tokens || !Array.isArray(row.tokens)) row.tokens = [];
+            if (!row.ner_tags || !Array.isArray(row.ner_tags)) row.ner_tags = [];
+            if (typeof row.success !== 'boolean') row.success = false;
+            
+            // Нормализуем данные
+            normalizeRowData(row);
+            
+            csvData.push(row);
             
         } catch (error) {
             console.error(`Ошибка обработки строки ${i}:`, error);
-            skippedRows++;
         }
     }
     
@@ -85,95 +93,77 @@ function parseCSV(csvText) {
         throw new Error('Не удалось обработать ни одной строки данных');
     }
     
-    console.log(`Обработка завершена: ${csvData.length} строк загружено, ${fixedRows} исправлено, ${skippedRows} пропущено`);
-    
-    if (fixedRows > 0) {
-        showStatus(`Внимание: ${fixedRows} строк были автоматически исправлены`, 'warning');
-    }
-    if (skippedRows > 0) {
-        showStatus(`Пропущено ${skippedRows} некорректных строк`, 'warning');
-    }
+    console.log(`Обработка завершена: ${csvData.length} строк загружено`);
 }
 
-// Создание объекта строки данных
-function createDataRow(values, headers) {
-    const row = {};
-    
-    // Базовая инициализация
-    row.dialog_id = '';
-    row.dialog_message_index = '';
-    row.original_text = '';
-    row.tokens = [];
-    row.ner_tags = [];
-    row.success = false;
-    
-    // Заполняем данные из значений
-    for (let j = 0; j < Math.min(headers.length, values.length); j++) {
-        const header = headers[j];
-        let value = values[j];
-        
-        // Обработка специальных полей
-        if (header === 'tokens' || header === 'ner_tags') {
-            value = parseArrayField(value);
-        } else if (header === 'success') {
-            value = parseBooleanField(value);
-        }
-        
-        row[header] = value;
-    }
-    
-    return row;
-}
-
-// Парсинг массива из строки
+// Функция для надежного парсинга массивов
 function parseArrayField(value) {
+    // Если уже массив - возвращаем как есть
     if (Array.isArray(value)) {
         return value;
     }
     
+    // Если не строка - возвращаем пустой массив
     if (typeof value !== 'string') {
         return [];
     }
     
-    value = value.trim();
+    let str = value.trim();
     
-    // Пустая строка
-    if (!value) {
+    // Обработка пустой строки
+    if (!str) {
         return [];
     }
     
-    // Попытка парсинга JSON
-    if (value.startsWith('[') && value.endsWith(']')) {
+    // Случай 1: Строка в формате ["token1", "token2", "token3"]
+    if (str.startsWith('[') && str.endsWith(']')) {
         try {
-            // Нормализация JSON строки
-            let normalized = value
+            // Нормализация JSON - заменяем двойные кавычки и обрабатываем экранирование
+            let normalized = str
                 .replace(/""/g, '"') // Двойные кавычки в одинарные
-                .replace(/'/g, '"')  // Одинарные в двойные
-                .replace(/,(\s*])/g, '$1') // Удаляем запятые перед закрывающей скобкой
-                .replace(/([^\[",]\s*)([^",\]\s]+)([^",\]])/g, '$1"$2"$3'); // Добавляем кавычки
+                .replace(/'/g, '"')  // Одинарные в двойные для JSON
+                .replace(/,(\s*])/g, '$1'); // Убираем лишние запятые
             
             const parsed = JSON.parse(normalized);
             if (Array.isArray(parsed)) {
-                return parsed.map(item => String(item).trim()).filter(item => item !== '');
+                return parsed.map(item => String(item));
             }
         } catch (e) {
-            console.warn('Не удалось распарсить JSON массив:', value, e);
+            console.warn('JSON parse failed, trying alternative methods:', str);
         }
     }
     
-    // Попытка парсинга как CSV строки
-    if (value.includes(',') || value.includes(';')) {
-        const separator = value.includes(';') ? ';' : ',';
-        const tokens = value.split(separator)
-            .map(token => token.trim().replace(/^["']|["']$/g, ''))
+    // Случай 2: Строка в формате "token1", "token2", "token3" (без скобок)
+    if (str.includes('"') && str.includes(',')) {
+        try {
+            // Пробуем добавить скобки и распарсить как JSON
+            const withBrackets = `[${str}]`;
+            const parsed = JSON.parse(withBrackets);
+            if (Array.isArray(parsed)) {
+                return parsed.map(item => String(item));
+            }
+        } catch (e) {
+            // Продолжаем к другим методам
+        }
+    }
+    
+    // Случай 3: Простая строка с разделителями-запятыми
+    if (str.includes(',')) {
+        const tokens = str.split(',')
+            .map(token => {
+                // Убираем кавычки и пробелы
+                return token.trim().replace(/^["']+|["']+$/g, '');
+            })
             .filter(token => token !== '');
+        
         if (tokens.length > 0) {
             return tokens;
         }
     }
     
-    // Если ничего не помогло, пробуем разбить по пробелам
-    return value.split(/\s+/).filter(token => token !== '');
+    // Случай 4: Одиночная строка (возможно, в кавычках)
+    const singleToken = str.replace(/^["']+|["']+$/g, '');
+    return singleToken ? [singleToken] : [];
 }
 
 // Парсинг boolean поля
@@ -187,89 +177,59 @@ function parseBooleanField(value) {
 
 // Нормализация данных строки
 function normalizeRowData(row) {
-    const result = { valid: true, fixed: false };
-    
-    // Проверяем обязательные поля
-    if (!row.original_text || typeof row.original_text !== 'string') {
-        if (Array.isArray(row.tokens) && row.tokens.length > 0) {
-            // Восстанавливаем original_text из tokens
-            row.original_text = row.tokens.join(' ');
-            result.fixed = true;
-        } else {
-            result.valid = false;
-            return result;
-        }
+    // Если нет original_text, но есть tokens - создаем original_text
+    if ((!row.original_text || row.original_text === '') && Array.isArray(row.tokens) && row.tokens.length > 0) {
+        row.original_text = row.tokens.join(' ');
     }
     
-    // Нормализуем tokens
-    if (!Array.isArray(row.tokens) || row.tokens.length === 0) {
+    // Если нет tokens или tokens некорректен, но есть original_text - токенизируем
+    if ((!row.tokens || !Array.isArray(row.tokens) || row.tokens.length === 0) && row.original_text) {
         row.tokens = tokenizeText(row.original_text);
-        result.fixed = true;
-    } else {
-        // Очищаем tokens
+    }
+    
+    // Убеждаемся, что tokens - это массив строк
+    if (Array.isArray(row.tokens)) {
         row.tokens = row.tokens.map(token => String(token).trim()).filter(token => token !== '');
-        if (row.tokens.length === 0) {
-            row.tokens = tokenizeText(row.original_text);
-            result.fixed = true;
-        }
+    } else {
+        row.tokens = [];
     }
     
     // Нормализуем ner_tags
-    if (!Array.isArray(row.ner_tags) || row.ner_tags.length !== row.tokens.length) {
-        row.ner_tags = Array(row.tokens.length).fill('O');
-        result.fixed = true;
-    } else {
-        // Очищаем и проверяем ner_tags
-        row.ner_tags = row.ner_tags.map(tag => {
-            const strTag = String(tag).trim().toUpperCase();
-            // Проверяем валидность тега
-            if (strTag === 'O' || strTag.startsWith('B-') || strTag.startsWith('I-')) {
-                return strTag;
-            }
-            return 'O';
-        });
-        
-        // Если длины не совпадают, исправляем
-        if (row.ner_tags.length !== row.tokens.length) {
-            if (row.ner_tags.length > row.tokens.length) {
-                row.ner_tags = row.ner_tags.slice(0, row.tokens.length);
-            } else {
-                row.ner_tags = [...row.ner_tags, ...Array(row.tokens.length - row.ner_tags.length).fill('O')];
-            }
-            result.fixed = true;
+    if (!Array.isArray(row.ner_tags)) {
+        row.ner_tags = [];
+    }
+    
+    // Выравниваем длины tokens и ner_tags
+    if (row.tokens.length !== row.ner_tags.length) {
+        if (row.ner_tags.length > row.tokens.length) {
+            row.ner_tags = row.ner_tags.slice(0, row.tokens.length);
+        } else {
+            // Добиваем недостающие теги значением 'O'
+            const additionalTags = Array(row.tokens.length - row.ner_tags.length).fill('O');
+            row.ner_tags = [...row.ner_tags, ...additionalTags];
         }
     }
     
-    // Нормализуем success
-    if (typeof row.success !== 'boolean') {
-        row.success = true;
-        result.fixed = true;
-    }
-    
-    // Заполняем обязательные поля, если они отсутствуют
-    if (!row.dialog_id) {
-        row.dialog_id = `auto-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        result.fixed = true;
-    }
-    
-    if (!row.dialog_message_index && row.dialog_message_index !== 0) {
-        row.dialog_message_index = '1';
-        result.fixed = true;
-    }
-    
-    return result;
+    // Нормализуем теги (должны быть строками)
+    row.ner_tags = row.ner_tags.map(tag => {
+        const strTag = String(tag).trim().toUpperCase();
+        // Проверяем валидность тега
+        if (strTag === 'O' || strTag.startsWith('B-') || strTag.startsWith('I-')) {
+            return strTag;
+        }
+        return 'O';
+    });
 }
 
-// Улучшенная токенизация текста
+// Токенизация текста
 function tokenizeText(text) {
     if (!text || typeof text !== 'string') return [];
     
     // Улучшенное регулярное выражение для токенизации
-    // Учитывает кириллицу, латиницу, цифры, email, номера и знаки препинания
     const tokenRegex = /[\w\u0400-\u04FF@]+|[^\w\s]|_+/g;
     const tokens = text.match(tokenRegex) || [];
     
-    // Фильтруем пустые токены и нормализуем
+    // Фильтруем пустые токены
     return tokens
         .map(token => token.trim())
         .filter(token => token !== '')
@@ -283,16 +243,9 @@ function parseCSVLine(line) {
     let current = '';
     let inQuotes = false;
     let quoteChar = '';
-    let escapeNext = false;
     
     for (let i = 0; i < line.length; i++) {
         const char = line[i];
-        
-        if (escapeNext) {
-            current += char;
-            escapeNext = false;
-            continue;
-        }
         
         if ((char === '"' || char === "'") && !inQuotes) {
             inQuotes = true;
@@ -305,8 +258,6 @@ function parseCSVLine(line) {
             } else {
                 inQuotes = false;
             }
-        } else if (char === '\\' && inQuotes) {
-            escapeNext = true;
         } else if (char === ',' && !inQuotes) {
             result.push(current);
             current = '';
@@ -318,7 +269,7 @@ function parseCSVLine(line) {
     // Добавляем последнее поле
     result.push(current);
     
-    // Очищаем поля
+    // Очищаем поля от окружающих кавычек
     return result.map(field => {
         let cleaned = field.trim();
         // Удаляем окружающие кавычки, если они есть
@@ -344,11 +295,8 @@ function displayRow(index) {
     document.getElementById('messageIndex').textContent = row.dialog_message_index || 'N/A';
     document.getElementById('originalText').textContent = row.original_text || 'N/A';
     
-    // Статус с учетом автоматического исправления
+    // Статус
     let statusText = row.success ? 'Успешно' : 'Не размечено';
-    if (row.autoFixed) {
-        statusText += ' (автоматически исправлено)';
-    }
     document.getElementById('successStatus').textContent = statusText;
     
     // Обновление индекса
@@ -359,32 +307,20 @@ function displayRow(index) {
     
     // Сброс выбранных токенов
     selectedTokens = [];
-    
-    // Показываем предупреждение, если строка была исправлена
-    if (row.autoFixed) {
-        const statusElement = document.getElementById('statusMessage');
-        statusElement.innerHTML = `Строка была автоматически исправлена. <button onclick="revertAutoFix(${index})">Отменить исправление</button>`;
-        statusElement.className = 'status-message warning';
-        statusElement.style.display = 'block';
-    }
 }
 
-// Функция отмены автоматического исправления
-function revertAutoFix(index) {
-    if (confirm('Вы уверены, что хотите отменить автоматическое исправление? Строка может стать некорректной.')) {
-        delete csvData[index].autoFixed;
-        displayRow(index);
-        showStatus('Автоматическое исправление отменено', 'success');
-    }
-}
-
-// Отображение токенов
+// Отображение токенов - КЛЮЧЕВАЯ ФУНКЦИЯ, ИСПРАВЛЯЮЩАЯ ПРОБЛЕМУ
 function displayTokens(tokens, tags) {
     const container = document.getElementById('tokensContainer');
     container.innerHTML = '';
     
-    if (!tokens || !tags || !Array.isArray(tokens) || !Array.isArray(tags)) {
-        container.innerHTML = '<div class="error-message">Ошибка: некорректные данные токенов</div>';
+    // ДЕБАГ: Логируем что мы получаем
+    console.log('Tokens data:', tokens);
+    console.log('Tags data:', tags);
+    
+    // Убеждаемся, что это массивы
+    if (!Array.isArray(tokens) || !Array.isArray(tags)) {
+        container.innerHTML = '<div class="error-message">Ошибка: данные токенов не являются массивами</div>';
         return;
     }
     
@@ -396,6 +332,25 @@ function displayTokens(tokens, tags) {
     if (tokens.length !== tags.length) {
         container.innerHTML = '<div class="error-message">Ошибка: количество токенов и тегов не совпадает</div>';
         return;
+    }
+    
+    // ВАЖНО: Проверяем, не является ли первый токен строковым представлением массива
+    if (tokens.length === 1 && typeof tokens[0] === 'string' && 
+        (tokens[0].startsWith('[') || tokens[0].includes('","'))) {
+        console.log('Обнаружена строка с массивом, пытаемся исправить...');
+        const fixedTokens = parseArrayField(tokens[0]);
+        const fixedTags = parseArrayField(tags[0]);
+        
+        if (fixedTokens.length > 0) {
+            console.log('Исправленные токены:', fixedTokens);
+            // Обновляем данные в текущей строке
+            csvData[currentRowIndex].tokens = fixedTokens;
+            csvData[currentRowIndex].ner_tags = fixedTags.length === fixedTokens.length ? fixedTags : Array(fixedTokens.length).fill('O');
+            
+            // Обновляем отображение с исправленными данными
+            displayTokens(fixedTokens, csvData[currentRowIndex].ner_tags);
+            return;
+        }
     }
     
     // Информация о выбранных токенах
@@ -416,10 +371,25 @@ function displayTokens(tokens, tags) {
         container.appendChild(selectionInfo);
     }
     
-    // Создание элементов токенов
+    // Создание элементов токенов - ОСНОВНОЙ БЛОК
     for (let i = 0; i < tokens.length; i++) {
-        const token = tokens[i];
+        let token = tokens[i];
         const tag = tags[i];
+        
+        // Убеждаемся, что токен - это строка, а не массив
+        if (Array.isArray(token)) {
+            console.warn('Токен является массивом, преобразуем в строку:', token);
+            token = token.join(' ');
+        }
+        
+        // Если токен все еще выглядит как массив в строке, пытаемся исправить
+        if (typeof token === 'string' && token.startsWith('[') && token.includes('","')) {
+            console.warn('Обнаружен строковый массив в токене:', token);
+            const fixed = parseArrayField(token);
+            if (fixed.length > 0) {
+                token = fixed[0]; // Берем первый элемент
+            }
+        }
         
         const tokenElement = document.createElement('div');
         tokenElement.className = `token token-${tag} ${selectedTokens.includes(i) ? 'selected' : ''}`;
@@ -440,52 +410,8 @@ function displayTokens(tokens, tags) {
             toggleTokenSelection(i);
         });
         
-        // Добавляем контекстное меню для правой кнопки мыши
-        tokenElement.addEventListener('contextmenu', function(e) {
-            e.preventDefault();
-            showTokenContextMenu(e, i, token, tag);
-        });
-        
         container.appendChild(tokenElement);
     }
-}
-
-// Контекстное меню для токена
-function showTokenContextMenu(event, index, token, tag) {
-    // Удаляем существующее контекстное меню
-    const existingMenu = document.getElementById('tokenContextMenu');
-    if (existingMenu) {
-        existingMenu.remove();
-    }
-    
-    const menu = document.createElement('div');
-    menu.id = 'tokenContextMenu';
-    menu.className = 'context-menu';
-    menu.style.position = 'fixed';
-    menu.style.left = event.clientX + 'px';
-    menu.style.top = event.clientY + 'px';
-    menu.style.zIndex = '1000';
-    
-    menu.innerHTML = `
-        <div class="context-menu-item" onclick="editToken(${index})">Редактировать токен</div>
-        <div class="context-menu-item" onclick="splitToken(${index})">Разделить токен</div>
-        <div class="context-menu-item" onclick="mergeWithNext(${index})">Объединить со следующим</div>
-        <div class="context-menu-divider"></div>
-        <div class="context-menu-item" onclick="setTagForToken(${index}, 'O')">Пометить как O</div>
-    `;
-    
-    document.body.appendChild(menu);
-    
-    // Закрываем меню при клике вне его
-    setTimeout(() => {
-        const closeMenu = (e) => {
-            if (!menu.contains(e.target)) {
-                menu.remove();
-                document.removeEventListener('click', closeMenu);
-            }
-        };
-        document.addEventListener('click', closeMenu);
-    }, 100);
 }
 
 // Очистка выбора
@@ -514,10 +440,7 @@ function toggleTokenSelection(index) {
         selectedTokens.splice(tokenIndex, 1);
     }
     
-    // Сортируем для последовательного отображения
     selectedTokens.sort((a, b) => a - b);
-    
-    // Обновляем отображение
     displayTokens(csvData[currentRowIndex].tokens, csvData[currentRowIndex].ner_tags);
 }
 
@@ -543,7 +466,6 @@ document.querySelectorAll('.tag-btn').forEach(button => {
         row.success = true;
         document.getElementById('successStatus').textContent = 'Успешно (изменено)';
         
-        // Сортируем выбранные токены
         selectedTokens.sort((a, b) => a - b);
         
         // Для метки O
@@ -578,29 +500,6 @@ document.querySelectorAll('.tag-btn').forEach(button => {
                 });
             }
             
-            // Проверка контекста после последнего токена
-            const lastSelected = selectedTokens[selectedTokens.length - 1];
-            const nextTag = lastSelected < tokens.length - 1 ? nerTags[lastSelected + 1] : null;
-            
-            if (nextTag && nextTag === `I-${tag}` && !selectedTokens.includes(lastSelected + 1)) {
-                setTimeout(() => {
-                    if (confirm('Следующий токен уже помечен как продолжение этой сущности. Хотите включить его в разметку?')) {
-                        let nextIndex = lastSelected + 1;
-                        const tokensToAdd = [];
-                        
-                        while (nextIndex < tokens.length && nerTags[nextIndex] === `I-${tag}`) {
-                            tokensToAdd.push(nextIndex);
-                            nextIndex++;
-                        }
-                        
-                        selectedTokens.push(...tokensToAdd);
-                        selectedTokens.sort((a, b) => a - b);
-                        displayTokens(row.tokens, row.ner_tags);
-                        showStatus(`Добавлено ${tokensToAdd.length} токенов к разметке`, 'success');
-                    }
-                }, 100);
-            }
-            
             const selectedText = selectedTokens.map(i => tokens[i]).join(' ');
             showStatus(`Токены "${selectedText}" помечены как ${usedPrefix}${tag}`, 'success');
         }
@@ -615,7 +514,6 @@ document.getElementById('prevBtn').addEventListener('click', function() {
     if (currentRowIndex > 0) {
         currentRowIndex--;
         displayRow(currentRowIndex);
-        showStatus(`Переход к строке ${currentRowIndex + 1}`, 'success');
     }
 });
 
@@ -623,7 +521,6 @@ document.getElementById('nextBtn').addEventListener('click', function() {
     if (currentRowIndex < csvData.length - 1) {
         currentRowIndex++;
         displayRow(currentRowIndex);
-        showStatus(`Переход к строке ${currentRowIndex + 1}`, 'success');
     }
 });
 
@@ -659,7 +556,6 @@ document.getElementById('editBtn').addEventListener('click', function() {
     const row = csvData[currentRowIndex];
     
     if (confirm('Вы уверены, что хотите полностью переразметить эту строку? Все существующие метки будут сброшены.')) {
-        // Сброс всей разметки
         row.ner_tags = Array(row.tokens.length).fill('O');
         row.success = false;
         
@@ -694,7 +590,6 @@ document.getElementById('exportBtn').addEventListener('click', function() {
                 let value = row[header];
                 
                 if (Array.isArray(value)) {
-                    // Сериализуем массивы в JSON строку
                     value = JSON.stringify(value).replace(/"/g, '""');
                     return `"${value}"`;
                 }
@@ -703,7 +598,6 @@ document.getElementById('exportBtn').addEventListener('click', function() {
                     return value ? 'True' : 'False';
                 }
                 
-                // Экранируем строки, которые содержат специальные символы
                 if (typeof value === 'string' && (value.includes(',') || value.includes('"') || value.includes('\n'))) {
                     value = value.replace(/"/g, '""');
                     return `"${value}"`;
@@ -728,68 +622,8 @@ document.getElementById('exportBtn').addEventListener('click', function() {
         showStatus('Файл успешно экспортирован', 'success');
     } catch (error) {
         showStatus('Ошибка при экспорте файла: ' + error.message, 'error');
-        console.error('Ошибка экспорта:', error);
     }
 });
-
-// Вспомогательные функции для контекстного меню
-function editToken(index) {
-    const row = csvData[currentRowIndex];
-    const currentToken = row.tokens[index];
-    const newToken = prompt('Введите новый текст токена:', currentToken);
-    
-    if (newToken !== null && newToken.trim() !== '') {
-        row.tokens[index] = newToken.trim();
-        row.success = true;
-        displayRow(currentRowIndex);
-        showStatus('Токен изменен', 'success');
-    }
-}
-
-function splitToken(index) {
-    const row = csvData[currentRowIndex];
-    const currentToken = row.tokens[index];
-    const parts = prompt('Введите части для разделения (через запятую):', currentToken);
-    
-    if (parts !== null && parts.trim() !== '') {
-        const newTokens = parts.split(',').map(part => part.trim()).filter(part => part !== '');
-        if (newTokens.length > 1) {
-            // Заменяем текущий токен на новые токены
-            row.tokens.splice(index, 1, ...newTokens);
-            // Создаем соответствующие теги
-            const currentTag = row.ner_tags[index];
-            const newTags = Array(newTokens.length).fill(currentTag);
-            row.ner_tags.splice(index, 1, ...newTags);
-            
-            row.success = true;
-            displayRow(currentRowIndex);
-            showStatus('Токен разделен', 'success');
-        }
-    }
-}
-
-function mergeWithNext(index) {
-    const row = csvData[currentRowIndex];
-    if (index < row.tokens.length - 1) {
-        // Объединяем с следующим токеном
-        row.tokens[index] = row.tokens[index] + row.tokens[index + 1];
-        row.tokens.splice(index + 1, 1);
-        // Удаляем соответствующий тег
-        row.ner_tags.splice(index + 1, 1);
-        
-        row.success = true;
-        displayRow(currentRowIndex);
-        showStatus('Токены объединены', 'success');
-    }
-}
-
-function setTagForToken(index, tag) {
-    const row = csvData[currentRowIndex];
-    row.ner_tags[index] = tag;
-    row.success = true;
-    displayRow(currentRowIndex);
-    showStatus('Метка установлена', 'success');
-}
 
 // Очистка отображения
 function clearDisplay() {
@@ -829,12 +663,6 @@ document.addEventListener('keydown', function(e) {
         selectedTokens = [];
         if (csvData.length > 0) {
             displayTokens(csvData[currentRowIndex].tokens, csvData[currentRowIndex].ner_tags);
-        }
-        
-        // Закрываем контекстное меню
-        const contextMenu = document.getElementById('tokenContextMenu');
-        if (contextMenu) {
-            contextMenu.remove();
         }
     }
 });
