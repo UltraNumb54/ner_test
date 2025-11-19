@@ -1,0 +1,329 @@
+# inference.py
+import json
+import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+import re
+import os
+from collections import defaultdict
+
+class NERPredictor:
+    def __init__(self, model_path):
+        """
+        Инициализация NER модели для инференса
+        
+        Args:
+            model_path: путь к обученной модели
+        """
+        print(f"Загрузка модели из {model_path}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForTokenClassification.from_pretrained(model_path)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Используется устройство: {self.device}")
+        
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Загрузка маппинга меток
+        label_mapping_path = f'{model_path}/label_mapping.json'
+        if os.path.exists(label_mapping_path):
+            with open(label_mapping_path, 'r', encoding='utf-8') as f:
+                label_mapping = json.load(f)
+                self.id2label = label_mapping['id2label']
+                self.label2id = label_mapping['label2id']
+            print(f"Загружено {len(self.id2label)} меток")
+        else:
+            print(f"Внимание: файл маппинга {label_mapping_path} не найден!")
+            # Создаем базовый маппинг на основе модели
+            self.id2label = self.model.config.id2label
+            self.label2id = self.model.config.label2id
+    
+    def tokenize_text(self, text):
+        """
+        Токенизация текста на слова и знаки препинания
+        
+        Args:
+            text: входной текст
+            
+        Returns:
+            список токенов
+        """
+        # Улучшенная токенизация, которая лучше обрабатывает различные случаи
+        if not text or not text.strip():
+            return []
+        
+        # Разбиваем на слова, знаки препинания и пробелы
+        tokens = re.findall(r'\w+|[^\w\s]|\s+', text)
+        # Убираем полностью пустые токены, но оставляем пробелы как отдельные токены
+        tokens = [token for token in tokens if token != '']
+        
+        return tokens
+    
+    def predict_entities(self, text):
+        """
+        Предсказание сущностей в тексте
+        
+        Args:
+            text: входной текст
+            
+        Returns:
+            список кортежей (сущность, тип_сущности)
+        """
+        if not text or not text.strip():
+            return []
+        
+        # Токенизация текста
+        tokens = self.tokenize_text(text)
+        
+        if not tokens:
+            return []
+        
+        # Токенизация для модели
+        encoding = self.tokenizer(
+            tokens,
+            is_split_into_words=True,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt",
+            return_offsets_mapping=True
+        )
+        
+        # Предсказание
+        with torch.no_grad():
+            inputs = {k: v.to(self.device) for k, v in encoding.items()}
+            outputs = self.model(**inputs)
+            predictions = torch.argmax(outputs.logits, dim=2)
+        
+        # Обработка результатов
+        entities = self._process_predictions(tokens, encoding, predictions)
+        
+        return entities
+    
+    def _process_predictions(self, original_tokens, encoding, predictions):
+        """
+        Обработка предсказаний и преобразование в читаемый формат
+        """
+        word_predictions = []
+        word_ids = encoding.word_ids(batch_index=0)
+        
+        current_entity = ""
+        current_entity_type = None
+        entity_started = False
+        
+        for i, (word_id, pred_id) in enumerate(zip(word_ids, predictions[0])):
+            if word_id is None:
+                # Специальные токены - пропускаем
+                continue
+            
+            token = original_tokens[word_id] if word_id < len(original_tokens) else ""
+            pred_str = str(pred_id.item())
+            label = self.id2label.get(pred_str, 'O') if pred_str in self.id2label else 'O'
+            
+            # Определяем, является ли токен началом сущности
+            is_beginning = label.startswith('B-') or (label != 'O' and current_entity_type != label)
+            
+            if is_beginning and current_entity:
+                # Сохраняем предыдущую сущность
+                word_predictions.append((current_entity.strip(), current_entity_type))
+                current_entity = ""
+            
+            if label != 'O':
+                entity_type = label[2:] if label.startswith('B-') or label.startswith('I-') else label
+                
+                if not current_entity or is_beginning:
+                    current_entity = token
+                    current_entity_type = entity_type
+                else:
+                    # Добавляем к текущей сущности (с пробелом если нужно)
+                    if token.strip():  # Если токен не пробел
+                        if current_entity and not current_entity.endswith(' ') and not token.startswith(('.', ',', '!', '?')):
+                            current_entity += " " + token
+                        else:
+                            current_entity += token
+            elif current_entity:
+                # Завершаем текущую сущность
+                word_predictions.append((current_entity.strip(), current_entity_type))
+                current_entity = ""
+                current_entity_type = None
+        
+        # Добавляем последнюю сущность если есть
+        if current_entity:
+            word_predictions.append((current_entity.strip(), current_entity_type))
+        
+        return word_predictions
+    
+    def predict_batch(self, texts):
+        """
+        Пакетное предсказание для списка текстов
+        
+        Args:
+            texts: список текстов
+            
+        Returns:
+            список результатов для каждого текста
+        """
+        results = []
+        for text in texts:
+            entities = self.predict_entities(text)
+            results.append({
+                'text': text,
+                'entities': entities,
+                'entities_count': len(entities)
+            })
+        return results
+
+def process_json_file(json_file, model_path, output_file):
+    """
+    Обработка JSON файла с диалогами
+    
+    Args:
+        json_file: путь к JSON файлу
+        model_path: путь к модели
+        output_file: путь для сохранения результатов
+    """
+    print(f"Загрузка данных из {json_file}...")
+    
+    # Загрузка JSON файла
+    with open(json_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    # Извлекаем все сообщения
+    messages = []
+    for dialog in data:
+        dialog_id = dialog.get('id', 'unknown')
+        if 'dialogue' in dialog:
+            for message_idx, message in enumerate(dialog['dialogue']):
+                if 'text' in message and message['text'].strip():
+                    # Обрабатываем многострочный текст
+                    text_lines = message['text'].strip().split('\n')
+                    for line_idx, line in enumerate(text_lines):
+                        if line.strip():
+                            messages.append({
+                                'dialog_id': dialog_id,
+                                'message_index': f"{message_idx}_{line_idx}",
+                                'role': message.get('role', 'unknown'),
+                                'text': line.strip(),
+                                'topic': dialog.get('topic', 'unknown'),
+                                'source': dialog.get('source', 'unknown')
+                            })
+    
+    print(f"Найдено сообщений для обработки: {len(messages)}")
+    
+    # Загрузка модели
+    predictor = NERPredictor(model_path)
+    
+    # Обработка сообщений
+    results = []
+    for i, message in enumerate(messages):
+        if i % 50 == 0:
+            print(f"Обработано {i}/{len(messages)} сообщений...")
+        
+        entities = predictor.predict_entities(message['text'])
+        entities_str = "; ".join([f"{entity} -> {label}" for entity, label in entities])
+        
+        results.append({
+            'dialog_id': message['dialog_id'],
+            'message_index': message['message_index'],
+            'role': message['role'],
+            'topic': message['topic'],
+            'source': message['source'],
+            'text': message['text'],
+            'entities': entities_str,
+            'entities_count': len(entities)
+        })
+    
+    # Сохранение результатов
+    df = pd.DataFrame(results)
+    df.to_csv(output_file, index=False, encoding='utf-8')
+    
+    # Статистика
+    total_entities = df['entities_count'].sum()
+    messages_with_entities = len(df[df['entities_count'] > 0])
+    
+    print(f"\nРезультаты сохранены в {output_file}")
+    print(f"Обработано сообщений: {len(results)}")
+    print(f"Сообщений с сущностями: {messages_with_entities}")
+    print(f"Всего найдено сущностей: {total_entities}")
+    
+    # Анализ типов сущностей
+    all_entities = []
+    for entities_str in df['entities']:
+        if entities_str:
+            entities = entities_str.split('; ')
+            for entity in entities:
+                if ' -> ' in entity:
+                    _, label = entity.split(' -> ', 1)
+                    all_entities.append(label)
+    
+    if all_entities:
+        from collections import Counter
+        entity_counts = Counter(all_entities)
+        print("\nРаспределение типов сущностей:")
+        for entity_type, count in entity_counts.most_common():
+            print(f"  {entity_type}: {count}")
+    
+    return df
+
+def interactive_mode(model_path):
+    """
+    Интерактивный режим для тестирования модели
+    """
+    print("\n" + "="*50)
+    print("ИНТЕРАКТИВНЫЙ РЕЖИМ")
+    print("Введите текст для распознавания сущностей (или 'quit' для выхода)")
+    print("="*50)
+    
+    predictor = NERPredictor(model_path)
+    
+    while True:
+        text = input("\nВведите текст: ").strip()
+        
+        if text.lower() in ['quit', 'exit', 'q']:
+            break
+        
+        if not text:
+            continue
+        
+        entities = predictor.predict_entities(text)
+        
+        print("\nРезультаты:")
+        if entities:
+            for entity, label in entities:
+                print(f"  {entity} -> {label}")
+        else:
+            print("  Сущности не найдены")
+
+def main():
+    """
+    Основная функция инференса
+    """
+    # ==================== КОНФИГУРАЦИЯ ====================
+    # Укажите здесь ваши пути
+    MODEL_PATH = "ner-model-improved-final"      # Путь к обученной модели
+    JSON_INPUT_FILE = "test_data.json"           # Путь к JSON файлу для обработки (опционально)
+    OUTPUT_CSV = "ner_predictions.csv"           # Файл для сохранения результатов
+    USE_INTERACTIVE_MODE = True                  # True для интерактивного режима, False для обработки файла
+    # ======================================================
+    
+    print("=" * 50)
+    print("ЗАПУСК ИНФЕРЕНСА NER МОДЕЛИ")
+    print("=" * 50)
+    
+    if USE_INTERACTIVE_MODE:
+        # Интерактивный режим
+        interactive_mode(MODEL_PATH)
+    else:
+        # Обработка JSON файла
+        if not os.path.exists(JSON_INPUT_FILE):
+            print(f"Файл {JSON_INPUT_FILE} не найден!")
+            return
+        
+        process_json_file(JSON_INPUT_FILE, MODEL_PATH, OUTPUT_CSV)
+    
+    print("\n" + "=" * 50)
+    print("ИНФЕРЕНС ЗАВЕРШЕН!")
+    print("=" * 50)
+
+if __name__ == "__main__":
+    main()
