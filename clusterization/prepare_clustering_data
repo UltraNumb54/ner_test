@@ -1,3 +1,201 @@
+edit
+
+def create_three_files(input_file, model_path, output_analysis, output_clustering, output_first_messages):
+    """
+    Создает три файла с разными форматами данных
+    Все файлы содержат текст с заменами через NER модель
+    """
+    print(f"Загрузка данных из {input_file}...")
+    
+    # Проверка существования файлов
+    if not os.path.exists(input_file):
+        print(f"Ошибка: Файл {input_file} не существует")
+        return
+    
+    if not os.path.exists(model_path):
+        print(f"Ошибка: Модель {model_path} не существует")
+        return
+    
+    # Загрузка исходного JSON
+    try:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Ошибка загрузки JSON: {e}")
+        return
+    
+    print(f"Загружено диалогов: {len(data)}")
+    
+    # Инициализация заменщика сущностей
+    replacer = EntityReplacer(model_path)
+    
+    # Данные для трех файлов
+    analysis_data = []      # Для анализа: полная информация о заменах
+    clustering_data = []    # Для кластеризации: текст с заменами и ролями
+    first_messages_data = [] # Первые сообщения с заменами
+    
+    # Статистика
+    stats = {
+        'total_dialogs': len(data),
+        'total_messages': 0,
+        'processed_messages': 0,
+        'total_replacements': 0
+    }
+    
+    for dialog in tqdm(data, desc="Обработка диалогов"):
+        dialog_id = dialog.get('id', 'unknown')
+        topic = dialog.get('topic', 'unknown')
+        source = dialog.get('source', 'unknown')
+        
+        # Данные для анализа
+        dialog_analysis = {
+            'dialog_id': dialog_id,
+            'topic': topic,
+            'source': source,
+            'messages': [],
+            'total_replacements': 0,
+            'all_text_original': '',
+            'all_text_replaced': ''
+        }
+        
+        # Данные для кластеризации - теперь с ролями
+        dialog_clustering = {
+            'dialog_id': dialog_id,
+            'topic': topic,
+            'source': source,
+            'text': '',  # Будет содержать текст с ролями
+            'text_with_roles': '',  # Явное поле для текста с ролями
+            'text_length': 0
+        }
+        
+        # Данные для первых сообщений (с заменами)
+        dialog_first_message = {
+            'dialog_id': dialog_id,
+            'topic': topic,
+            'source': source,
+            'first_message_original': '',  # Оригинальное первое сообщение
+            'first_message_replaced': '',  # Первое сообщение с заменами
+            'first_message_length': 0,
+            'first_message_role': ''  # Добавляем роль первого сообщения
+        }
+        
+        # Обработка каждого сообщения в диалоге
+        all_messages_original = []
+        all_messages_replaced = []
+        all_messages_with_roles = []  # Для хранения сообщений с ролями
+        
+        for i, message in enumerate(dialog.get('dialogue', [])):
+            stats['total_messages'] += 1
+            
+            original_text = message.get('text', '')
+            role = message.get('role', 'unknown')
+            
+            if not original_text.strip():
+                continue
+            
+            # Очищаем текст
+            cleaned_text = original_text.replace('\n', ' ').replace('\r', ' ').strip()
+            
+            # Замена сущностей во ВСЕХ сообщениях
+            replaced_text, replacements = replacer.replace_entities_in_text(cleaned_text)
+            
+            # Для первого сообщения сохраняем и оригинал и замененный вариант
+            if i == 0:
+                dialog_first_message['first_message_original'] = cleaned_text
+                dialog_first_message['first_message_replaced'] = replaced_text
+                dialog_first_message['first_message_length'] = len(replaced_text)
+                dialog_first_message['first_message_role'] = role
+            
+            # Собираем статистику
+            if replacements:
+                stats['processed_messages'] += 1
+                stats['total_replacements'] += len(replacements)
+                dialog_analysis['total_replacements'] += len(replacements)
+            
+            # Сохраняем для анализа
+            message_analysis = {
+                'role': role,
+                'text_original': cleaned_text,
+                'text_replaced': replaced_text,
+                'replacements': replacer.convert_to_serializable(replacements)
+            }
+            dialog_analysis['messages'].append(message_analysis)
+            
+            # Сохраняем тексты для объединения
+            all_messages_original.append(cleaned_text)
+            all_messages_replaced.append(replaced_text)
+            
+            # Для кластеризации: сохраняем сообщения с указанием ролей
+            message_with_role = f"{role}: {replaced_text}"
+            all_messages_with_roles.append(message_with_role)
+        
+        # Формируем полные тексты для анализа и кластеризации
+        full_text_original = " ".join(all_messages_original)
+        full_text_replaced = " ".join(all_messages_replaced)
+        full_text_with_roles = " ".join(all_messages_with_roles)  # Текст с ролями
+        
+        dialog_analysis['all_text_original'] = full_text_original
+        dialog_analysis['all_text_replaced'] = full_text_replaced
+        
+        # Для кластеризации используем текст с ролями
+        dialog_clustering['text'] = full_text_with_roles
+        dialog_clustering['text_with_roles'] = full_text_with_roles  # Дублируем для ясности
+        dialog_clustering['text_length'] = len(full_text_with_roles)
+        
+        # Добавляем в соответствующие списки
+        analysis_data.append(replacer.convert_to_serializable(dialog_analysis))
+        clustering_data.append(replacer.convert_to_serializable(dialog_clustering))
+        
+        # Добавляем first_message только если есть первое сообщение
+        if dialog_first_message['first_message_replaced']:
+            first_messages_data.append(replacer.convert_to_serializable(dialog_first_message))
+    
+    # Сохранение трех файлов
+    print("\nСохранение файлов...")
+    
+    try:
+        # 1. Файл анализа
+        with open(output_analysis, 'w', encoding='utf-8') as f:
+            json.dump(analysis_data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
+        print(f"Файл анализа сохранен: {output_analysis}")
+        
+        # 2. Файл для кластеризации (теперь с ролями)
+        with open(output_clustering, 'w', encoding='utf-8') as f:
+            json.dump(clustering_data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
+        print(f"Файл для кластеризации сохранен: {output_clustering} (теперь с ролями сообщений)")
+        
+        # 3. Файл с первыми сообщениями (с заменами)
+        with open(output_first_messages, 'w', encoding='utf-8') as f:
+            json.dump(first_messages_data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
+        print(f"Файл с первыми сообщениями сохранен: {output_first_messages}")
+        
+        # Статистика
+        print(f"\nСтатистика обработки:")
+        print(f"  Всего диалогов: {stats['total_dialogs']}")
+        print(f"  Всего сообщений: {stats['total_messages']}")
+        print(f"  Сообщений с заменами: {stats['processed_messages']}")
+        print(f"  Всего замен: {stats['total_replacements']}")
+        print(f"  Файлов создано: 3")
+        
+        # Статистика по типам замен
+        replacement_stats = defaultdict(int)
+        for dialog in analysis_data:
+            for message in dialog['messages']:
+                for replacement in message['replacements']:
+                    replacement_stats[replacement['replacement']] += 1
+        
+        print(f"\nРаспределение типов замен:")
+        for metka_type, count in sorted(replacement_stats.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {metka_type}: {count}")
+        
+    except Exception as e:
+        print(f"Ошибка сохранения файлов: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    return analysis_data, clustering_data, first_messages_data
+
+----------------
 # preprocess_entities_fixed.py
 import json
 import torch
