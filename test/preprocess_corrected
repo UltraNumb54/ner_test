@@ -1,0 +1,208 @@
+# final_preprocessing_fixed.py
+import pandas as pd
+import numpy as np
+import json
+import ast
+from sklearn.model_selection import train_test_split
+from collections import Counter
+import torch
+from transformers import AutoTokenizer
+import re
+
+def load_and_validate_data(csv_path):
+    """
+    Загрузка и валидация предобработанных данных
+    """
+    print("Загрузка данных...")
+    df = pd.read_csv(csv_path)
+    
+    # Проверяем наличие необходимых колонок
+    required_columns = ['dialog_id', 'dialog_message_index', 'original_text', 'tokens', 'ner_tags', 'success']
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    
+    if missing_columns:
+        raise ValueError(f"Отсутствуют колонки: {missing_columns}")
+    
+    # Оставляем только успешные примеры
+    df = df[df['success'] == True]
+    print(f"Успешных примеров: {len(df)}")
+    
+    return df
+
+def parse_list_column(column_data):
+    """
+    Парсинг столбца с списками (токены или NER теги)
+    """
+    try:
+        if isinstance(column_data, list):
+            return column_data
+        elif isinstance(column_data, str):
+            # Пробуем JSON парсинг
+            try:
+                return json.loads(column_data)
+            except json.JSONDecodeError:
+                # Пробуем ast.literal_eval для списков в виде строк
+                try:
+                    return ast.literal_eval(column_data)
+                except:
+                    # Простой split для строк вида "B-FIO,I-FIO,O"
+                    if ',' in column_data:
+                        return [tag.strip().replace("'", "").replace('"', '') 
+                               for tag in column_data.strip('[]').split(',')]
+        return []
+    except Exception as e:
+        print(f"Ошибка парсинга данных: {e}")
+        return []
+
+def create_label_mapping(df):
+    """
+    Создание маппинга меток
+    """
+    all_tags = []
+    
+    for tags_string in df['ner_tags']:
+        tags = parse_list_column(tags_string)
+        all_tags.extend(tags)
+    
+    # Уникальные метки (исключая -100 для игнорируемых токенов)
+    unique_tags = sorted(list(set([tag for tag in all_tags if tag != '-100'])))
+    
+    # Создаем маппинг с преобразованием в строки для JSON
+    label2id = {tag: int(idx) for idx, tag in enumerate(unique_tags)}
+    id2label = {int(idx): tag for idx, tag in enumerate(unique_tags)}
+    
+    print(f"Уникальных меток: {len(unique_tags)}")
+    print("Распределение меток:")
+    tag_counts = Counter(all_tags)
+    for tag, count in tag_counts.most_common():
+        print(f"  {tag}: {count}")
+    
+    return label2id, id2label, unique_tags
+
+def prepare_training_examples(df, label2id):
+    """
+    Подготовка примеров для обучения с использованием готовых токенов и меток
+    """
+    training_examples = []
+    skipped_count = 0
+    
+    for idx, row in df.iterrows():
+        try:
+            # Парсим готовые токены и метки
+            tokens = parse_list_column(row['tokens'])
+            ner_tags = parse_list_column(row['ner_tags'])
+            
+            # Проверяем, что оба списка не пустые
+            if not tokens or not ner_tags:
+                print(f"Пропуск строки {idx}: пустые токены или теги")
+                skipped_count += 1
+                continue
+            
+            # Проверяем соответствие количества токенов и меток
+            if len(tokens) != len(ner_tags):
+                print(f"Несоответствие в строке {idx}: {len(tokens)} токенов vs {len(ner_tags)} меток")
+                print(f"  Текст: '{row['original_text']}'")
+                print(f"  Токены: {tokens}")
+                print(f"  Метки: {ner_tags}")
+                skipped_count += 1
+                continue
+            
+            # Преобразуем текстовые метки в числовые ID
+            label_ids = [label2id.get(tag, -100) for tag in ner_tags]
+            
+            training_examples.append({
+                'id': f"{row['dialog_id']}_{row['dialog_message_index']}",
+                'tokens': tokens,
+                'ner_tags': ner_tags,
+                'label_ids': label_ids,
+                'original_text': row['original_text']
+            })
+            
+        except Exception as e:
+            print(f"Ошибка в строке {idx}: {e}")
+            skipped_count += 1
+            continue
+    
+    print(f"Подготовлено примеров: {len(training_examples)}")
+    print(f"Пропущено примеров: {skipped_count}")
+    
+    # Статистика по длине последовательностей
+    seq_lengths = [len(ex['tokens']) for ex in training_examples]
+    if seq_lengths:
+        print(f"Статистика длины последовательностей:")
+        print(f"  Минимум: {min(seq_lengths)}")
+        print(f"  Максимум: {max(seq_lengths)}")
+        print(f"  Среднее: {sum(seq_lengths) / len(seq_lengths):.2f}")
+    
+    return training_examples
+
+def split_data(examples, test_size=0.2, random_state=42):
+    """
+    Разделение данных на train/validation
+    """
+    train_examples, val_examples = train_test_split(
+        examples, 
+        test_size=test_size, 
+        random_state=random_state,
+        shuffle=True
+    )
+    
+    print(f"Train: {len(train_examples)} примеров")
+    print(f"Validation: {len(val_examples)} примеров")
+    
+    return train_examples, val_examples
+
+def save_processed_data(train_examples, val_examples, label2id, id2label, output_dir):
+    """
+    Сохранение обработанных данных с исправленными типами
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Преобразуем ключи в строки для JSON совместимости
+    label2id_str = {k: v for k, v in label2id.items()}
+    id2label_str = {str(k): v for k, v in id2label.items()}
+    
+    # Сохраняем маппинг меток
+    with open(f'{output_dir}/label_mapping.json', 'w', encoding='utf-8') as f:
+        json.dump({
+            'label2id': label2id_str,
+            'id2label': id2label_str
+        }, f, ensure_ascii=False, indent=2)
+    
+    # Сохраняем тренировочные данные
+    with open(f'{output_dir}/train_data.json', 'w', encoding='utf-8') as f:
+        for example in train_examples:
+            f.write(json.dumps(example, ensure_ascii=False) + '\n')
+    
+    # Сохраняем валидационные данные
+    with open(f'{output_dir}/val_data.json', 'w', encoding='utf-8') as f:
+        for example in val_examples:
+            f.write(json.dumps(example, ensure_ascii=False) + '\n')
+    
+    print(f"Данные сохранены в {output_dir}/")
+
+def main():
+    # Конфигурация
+    INPUT_CSV = "ner_dataset_preprocessed.csv"
+    OUTPUT_DIR = "training_data"
+    
+    # Загрузка данных
+    df = load_and_validate_data(INPUT_CSV)
+    
+    # Создание маппинга меток
+    label2id, id2label, unique_tags = create_label_mapping(df)
+    
+    # Подготовка примеров
+    examples = prepare_training_examples(df, label2id)
+    
+    # Разделение данных
+    train_examples, val_examples = split_data(examples)
+    
+    # Сохранение результатов
+    save_processed_data(train_examples, val_examples, label2id, id2label, OUTPUT_DIR)
+    
+    print("Финальная предобработка завершена!")
+
+if __name__ == "__main__":
+    main()
