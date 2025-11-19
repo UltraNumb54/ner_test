@@ -2,31 +2,21 @@
 import json
 import os
 import re
-from vllm import LLM, SamplingParams
+from openai import OpenAI
 import time
 from typing import Dict, List, Any
 from datetime import datetime
 
 class ClusterAnalyzer:
-    def __init__(self, model_path: str = "Qwen/Qwen2.5-7B-Instruct-AWQ"):
+    def __init__(self, base_url: str = "http://localhost:8000/v1", api_key: str = "EMPTY"):
         """
-        Инициализация анализатора кластеров с vLLM
+        Инициализация анализатора кластеров с подключением к запущенной модели через API
         """
-        print(f"Загрузка модели {model_path}...")
+        print(f"Подключение к модели по адресу {base_url}...")
         
-        self.llm = LLM(
-            model=model_path,
-            quantization="awq",
-            tensor_parallel_size=1,
-            gpu_memory_utilization=0.8,
-            max_model_len=8192
-        )
-        
-        self.sampling_params = SamplingParams(
-            temperature=0.3,
-            top_p=0.9,
-            max_tokens=2048,
-            stop=["<|im_end|>", "<|endoftext|>"]
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key
         )
         
         # Словарь для замены английских меток на русские
@@ -43,7 +33,18 @@ class ClusterAnalyzer:
             '[LK_NUM]': '[Номер лицевого счёта]'
         }
         
-        print("Модель загружена успешно!")
+        # Проверяем подключение
+        try:
+            # Простой тестовый запрос для проверки подключения
+            test_response = self.client.chat.completions.create(
+                model="test",
+                messages=[{"role": "user", "content": "Привет"}],
+                max_tokens=10
+            )
+            print("Подключение к модели установлено успешно!")
+        except Exception as e:
+            print(f"Ошибка подключения к модели: {e}")
+            raise
     
     def translate_and_merge_metkas(self, text: str) -> str:
         """
@@ -82,8 +83,7 @@ class ClusterAnalyzer:
             
             dialogs_text += f"Диалог {i+1} (ID: {dialog_id}):\n{processed_text}\n\n"
         
-        prompt = f"""<|im_start|>system
-Ты - эксперт по анализу диалогов и созданию инструкций для AI-агентов. Тебе предоставлены 20 диалогов из одного кластера, которые имеют общие характеристики.
+        prompt = f"""Ты - эксперт по анализу диалогов и созданию инструкций для AI-агентов. Тебе предоставлены 20 диалогов из одного кластера, которые имеют общие характеристики.
 
 ТВОЯ ЗАДАЧА:
 1. Проанализировать общие черты и тематику этих диалогов
@@ -111,11 +111,8 @@ class ClusterAnalyzer:
 2. [конкретная инструкция]
 3. [конкретная инструкция]
 [дополнительные инструкции по необходимости]
-<|im_end|>
-<|im_start|>user
-Проанализируй предоставленные диалоги и предоставь ответ в указанном формате.<|im_end|>
-<|im_start|>assistant
-"""
+
+Проанализируй предоставленные диалоги и предоставь ответ в указанном формате."""
         return prompt, dialog_ids
     
     def remove_think_tags(self, text: str) -> str:
@@ -145,9 +142,20 @@ class ClusterAnalyzer:
         
         try:
             prompt, dialog_ids = self.create_prompt(cluster_id, dialogs)
-            outputs = self.llm.generate([prompt], self.sampling_params)
-            raw_response = outputs[0].outputs[0].text
             
+            # Отправляем запрос к API модели
+            response = self.client.chat.completions.create(
+                model="qwen",  # Имя модели может быть любым, если сервер обслуживает одну модель
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                top_p=0.9,
+                max_tokens=2048,
+                stop=["<|im_end|>", "<|endoftext|>"]
+            )
+            
+            raw_response = response.choices[0].message.content
             cleaned_response = self.clean_response(raw_response)
             analysis = self.parse_structured_response(cleaned_response, cluster_id)
             
@@ -267,7 +275,7 @@ class ClusterAnalyzer:
         for cluster_id, dialogs in clusters_data.items():
             analysis = self.analyze_cluster(cluster_id, dialogs)
             results[cluster_id] = analysis
-            time.sleep(1)
+            time.sleep(1)  # Небольшая задержка между запросами
         
         self.save_json_results(results, f"{output_base_name}.json")
         self.save_txt_results(results, f"{output_base_name}.txt")
@@ -283,7 +291,7 @@ class ClusterAnalyzer:
         output_data = {
             'analysis_timestamp': datetime.now().isoformat(),
             'total_clusters_analyzed': len(results),
-            'model_used': 'Qwen2.5-7B-Instruct-AWQ',
+            'model_used': 'Qwen2.5-7B-Instruct-AWQ (через API)',
             'metka_translations_applied': self.metka_translations,
             'clusters': results
         }
@@ -304,7 +312,7 @@ class ClusterAnalyzer:
             f.write("=" * 60 + "\n\n")
             f.write(f"Время анализа: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Количество кластеров: {len(results)}\n")
-            f.write(f"Модель: Qwen2.5-7B-Instruct-AWQ\n")
+            f.write(f"Модель: Qwen2.5-7B-Instruct-AWQ (через API)\n")
             f.write(f"Применены переводы меток: {', '.join(self.metka_translations.values())}\n\n")
             
             for cluster_id, analysis in results.items():
@@ -436,11 +444,12 @@ def main():
     # ==================== КОНФИГУРАЦИЯ ====================
     INPUT_FILE = "top_20_per_class.json"
     OUTPUT_BASE_NAME = "cluster_analysis_final"
-    MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+    API_BASE_URL = "http://localhost:8000/v1"  # URL запущенной модели
+    API_KEY = "EMPTY"  # Обычно "EMPTY" для локальных моделей
     # ======================================================
     
     print("=" * 60)
-    print("АНАЛИЗ КЛАСТЕРОВ С ПЕРЕВОДОМ МЕТОК И ID ДИАЛОГОВ")
+    print("АНАЛИЗ КЛАСТЕРОВ С ПОДКЛЮЧЕНИЕМ К ЗАПУЩЕННОЙ МОДЕЛИ")
     print("=" * 60)
     
     if not os.path.exists(INPUT_FILE):
@@ -454,7 +463,7 @@ def main():
             print("Нет данных для анализа!")
             return
         
-        analyzer = ClusterAnalyzer(MODEL_PATH)
+        analyzer = ClusterAnalyzer(base_url=API_BASE_URL, api_key=API_KEY)
         results = analyzer.analyze_all_clusters(clusters_data, OUTPUT_BASE_NAME)
         post_process_files(OUTPUT_BASE_NAME)
         
@@ -469,151 +478,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# create_top_20_per_class_improved.py
-import json
-import os
-from collections import defaultdict
-
-def create_top_20_file(clustering_results_file: str, output_file: str):
-    """
-    Создает файл с топ-20 диалогами каждого класса с сохранением ID
-    """
-    print(f"Чтение файла кластеризации: {clustering_results_file}")
-    
-    if not os.path.exists(clustering_results_file):
-        print(f"Ошибка: файл {clustering_results_file} не найден!")
-        return
-    
-    with open(clustering_results_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    clusters = defaultdict(list)
-    
-    # Обрабатываем разные форматы входных данных
-    if isinstance(data, list):
-        for item in data:
-            cluster_id = item.get('cluster_id')
-            if cluster_id is not None:
-                # Убедимся, что у каждого диалога есть dialog_id
-                if 'dialog_id' not in item:
-                    item['dialog_id'] = f"cluster_{cluster_id}_{len(clusters[cluster_id])}"
-                clusters[cluster_id].append(item)
-    elif isinstance(data, dict) and 'clusters' in data:
-        clusters = data['clusters']
-    elif isinstance(data, dict):
-        clusters = data
-    
-    print(f"Найдено {len(clusters)} кластеров")
-    
-    # Для каждого кластера берем топ-20 диалогов
-    top_20_per_class = {}
-    
-    for cluster_id, dialogs in clusters.items():
-        if isinstance(dialogs, list):
-            # Сортируем по длине текста и берем топ-20
-            sorted_dialogs = sorted(dialogs, key=lambda x: len(x.get('text', '') or x.get('full_text', '')), reverse=True)
-            top_20_per_class[cluster_id] = sorted_dialogs[:20]
-        else:
-            top_20_per_class[cluster_id] = list(dialogs.values())[:20] if isinstance(dialogs, dict) else []
-        
-        # Проверяем, что у всех диалогов есть ID
-        for i, dialog in enumerate(top_20_per_class[cluster_id]):
-            if 'dialog_id' not in dialog:
-                dialog['dialog_id'] = f"cluster_{cluster_id}_{i}"
-        
-        print(f"Кластер {cluster_id}: {len(top_20_per_class[cluster_id])} диалогов")
-    
-    # Сохраняем результат
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(top_20_per_class, f, ensure_ascii=False, indent=2)
-    
-    # Статистика
-    total_dialogs = sum(len(dialogs) for dialogs in top_20_per_class.values())
-    print(f"Файл с топ-20 диалогами сохранен: {output_file}")
-    print(f"Всего диалогов для анализа: {total_dialogs}")
-    
-    # Проверяем наличие ID
-    missing_ids = 0
-    for cluster_id, dialogs in top_20_per_class.items():
-        for dialog in dialogs:
-            if 'dialog_id' not in dialog:
-                missing_ids += 1
-    
-    if missing_ids > 0:
-        print(f"Предупреждение: {missing_ids} диалогов без ID!")
-    else:
-        print("Все диалоги имеют ID")
-
-def main():
-    """
-    Основная функция создания файла с топ-20
-    """
-    # ==================== КОНФИГУРАЦИЯ ====================
-    CLUSTERING_RESULTS_FILE = "clustering_results.json"
-    OUTPUT_FILE = "top_20_per_class.json"
-    # ======================================================
-    
-    create_top_20_file(CLUSTERING_RESULTS_FILE, OUTPUT_FILE)
-
-if __name__ == "__main__":
-    main()
-
-
-# test_metka_translation.py
-import re
-
-def test_metka_translation():
-    """
-    Тестирование перевода и объединения меток
-    """
-    # Словарь переводов
-    metka_translations = {
-        '[FIO]': '[ФИО]',
-        '[PHONE]': '[Телефон]',
-        '[PHONE_NUM]': '[Телефон]',
-        '[EMAIL]': '[Email]',
-        '[DATE]': '[Дата]',
-        '[SUM]': '[Сумма]',
-        '[ORG]': '[Организация]',
-        '[LOC]': '[Адрес]',
-        '[READINGS]': '[Показания]',
-        '[LK_NUM]': '[Номер лицевого счёта]'
-    }
-    
-    def translate_and_merge_metkas(text):
-        # Заменяем английские метки на русские
-        for eng_metka, rus_metka in metka_translations.items():
-            text = text.replace(eng_metka, rus_metka)
-        
-        # Объединяем подряд идущие одинаковые русские метки
-        for rus_metka in metka_translations.values():
-            pattern = f'({re.escape(rus_metka)}\\s*)+'
-            text = re.sub(pattern, rus_metka + ' ', text)
-        
-        # Убираем лишние пробелы
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        return text
-    
-    # Тестовые примеры
-    test_cases = [
-        "Привет [FIO] [FIO] как дела?",
-        "Мой телефон [PHONE] [PHONE_NUM] [PHONE]",
-        "Дата [DATE] сумма [SUM] [SUM] [SUM]",
-        "[ORG] [LOC] [EMAIL] [LK_NUM]",
-        "[FIO] [FIO] [FIO] [PHONE] [PHONE]"
-    ]
-    
-    print("Тестирование перевода и объединения меток:")
-    print("=" * 50)
-    
-    for i, test in enumerate(test_cases, 1):
-        result = translate_and_merge_metkas(test)
-        print(f"Пример {i}:")
-        print(f"  До:   '{test}'")
-        print(f"  После: '{result}'")
-        print()
-
-if __name__ == "__main__":
-    test_metka_translation()
