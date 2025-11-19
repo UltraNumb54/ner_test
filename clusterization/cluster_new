@@ -1,0 +1,264 @@
+# advanced_topic_clustering_updated.py
+import json
+import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+import re
+from tqdm import tqdm
+
+class AdvancedTopicClustering:
+    def __init__(self, model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'):
+        """Инициализация модели для создания эмбеддингов"""
+        print(f"Загрузка модели {model_name}...")
+        self.model = SentenceTransformer(model_name)
+        print("Модель загружена успешно!")
+    
+    def load_clustering_data(self, clustering_file):
+        """Загрузка данных для кластеризации"""
+        print("Чтение файла для кластеризации...")
+        
+        with open(clustering_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        texts = []
+        dialog_info = []
+        
+        for item in data:
+            text = item.get('text', '') or item.get('full_text', '')
+            if text and len(text.strip()) > 20:  # Пропускаем слишком короткие тексты
+                texts.append(text.strip())
+                dialog_info.append({
+                    'dialog_id': item.get('dialog_id', 'unknown'),
+                    'original_topic': item.get('topic', 'unknown'),
+                    'source': item.get('source', 'unknown'),
+                    'text_length': len(text)
+                })
+        
+        print(f"Загружено {len(texts)} текстов для кластеризации")
+        return texts, dialog_info
+    
+    def load_first_messages(self, first_messages_file):
+        """Загрузка первых сообщений для анализа"""
+        print("Чтение файла первых сообщений...")
+        
+        with open(first_messages_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        first_messages = []
+        for item in data:
+            message = item.get('first_message', '')
+            if message:
+                first_messages.append({
+                    'dialog_id': item.get('dialog_id', 'unknown'),
+                    'message': message,
+                    'length': len(message)
+                })
+        
+        print(f"Загружено {len(first_messages)} первых сообщений")
+        return first_messages
+    
+    def create_embeddings(self, texts, batch_size=32):
+        """Создание векторных представлений текстов"""
+        print("Создание эмбеддингов...")
+        
+        embeddings = self.model.encode(
+            texts, 
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True
+        )
+        
+        print(f"Создано эмбеддингов: {embeddings.shape}")
+        return embeddings
+    
+    def find_optimal_clusters(self, embeddings, max_k=15):
+        """Поиск оптимального количества кластеров"""
+        print("Поиск оптимального количества кластеров...")
+        
+        if len(embeddings) < 3:
+            print("Недостаточно данных для анализа кластеров")
+            return 2
+        
+        wcss = []
+        silhouette_scores = []
+        k_range = range(2, min(max_k + 1, len(embeddings)))
+        
+        for k in tqdm(k_range, desc="Анализ кластеров"):
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(embeddings)
+            wcss.append(kmeans.inertia_)
+            
+            if len(set(labels)) > 1:
+                score = silhouette_score(embeddings, labels)
+                silhouette_scores.append(score)
+            else:
+                silhouette_scores.append(0)
+        
+        # Находим оптимальное k
+        if silhouette_scores:
+            optimal_k = k_range[np.argmax(silhouette_scores)]
+        else:
+            optimal_k = 2
+        
+        print(f"Оптимальное количество кластеров: {optimal_k}")
+        return optimal_k
+    
+    def perform_clustering(self, embeddings, n_clusters=None):
+        """Выполнение кластеризации K-means"""
+        if n_clusters is None:
+            n_clusters = min(10, max(2, len(embeddings) // 10))
+        
+        print(f"Выполнение K-means кластеризации с {n_clusters} кластерами...")
+        
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(embeddings)
+        
+        # Оценка качества
+        if len(set(labels)) > 1:
+            score = silhouette_score(embeddings, labels)
+            print(f"Silhouette Score: {score:.4f}")
+        else:
+            print("Создан только один кластер")
+        
+        return labels, kmeans
+    
+    def analyze_clusters(self, texts, labels, first_messages):
+        """Анализ кластеров и извлечение ключевых характеристик"""
+        print("Анализ кластеров...")
+        
+        cluster_analysis = {}
+        
+        for cluster_id in set(labels):
+            cluster_texts = [text for text, label in zip(texts, labels) if label == cluster_id]
+            cluster_first_messages = [msg for msg, label in zip(first_messages, labels) if label == cluster_id]
+            
+            # Анализ ключевых слов
+            all_text = " ".join(cluster_texts)
+            words = re.findall(r'\b[а-яё]{3,}\b', all_text.lower())
+            word_counts = Counter(words)
+            
+            # Исключаем стоп-слова и метки
+            stop_words = {'этот', 'такой', 'какой', 'который', 'очень', 'много', 'можно', 
+                         'нужно', 'должен', 'хочу', 'хотеть', 'хотят', 'свой', 'мочь'}
+            metka_words = {'fio', 'phone', 'email', 'date', 'sum', 'org', 'loc', 'readings'}
+            
+            keywords = [(word, count) for word, count in word_counts.most_common(30) 
+                       if word not in stop_words and word not in metka_words and count > 1]
+            
+            # Анализ первых сообщений
+            first_msg_samples = [msg['message'] for msg in cluster_first_messages[:3]]
+            
+            cluster_analysis[cluster_id] = {
+                'size': len(cluster_texts),
+                'keywords': keywords[:10],
+                'avg_text_length': np.mean([len(text) for text in cluster_texts]),
+                'first_messages_samples': first_msg_samples,
+                'common_metkas': self._extract_metkas(cluster_texts)
+            }
+        
+        return cluster_analysis
+    
+    def _extract_metkas(self, texts):
+        """Извлечение частотности меток в кластере"""
+        metkas = ['[FIO]', '[PHONE]', '[EMAIL]', '[DATE]', '[SUM]', '[ORG]', '[LOC]', '[READINGS]']
+        metka_counts = {metka: 0 for metka in metkas}
+        
+        for text in texts:
+            for metka in metkas:
+                if metka in text:
+                    metka_counts[metka] += 1
+        
+        return {k: v for k, v in metka_counts.items() if v > 0}
+    
+    def save_results(self, clustering_data, labels, cluster_analysis, output_file):
+        """Сохранение результатов кластеризации"""
+        print("Сохранение результатов...")
+        
+        results = []
+        for i, (item, label) in enumerate(zip(clustering_data, labels)):
+            results.append({
+                'dialog_id': item.get('dialog_id', f'unknown_{i}'),
+                'cluster_id': int(label),
+                'cluster_size': cluster_analysis[label]['size'],
+                'text': item.get('text', '') or item.get('full_text', ''),
+                'keywords': [word for word, count in cluster_analysis[label]['keywords'][:5]],
+                'original_topic': item.get('topic', 'unknown'),
+                'source': item.get('source', 'unknown')
+            })
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        
+        # Статистика
+        self._print_statistics(results, cluster_analysis)
+        
+        return results
+    
+    def _print_statistics(self, results, cluster_analysis):
+        """Вывод статистики кластеризации"""
+        print("\n" + "="*50)
+        print("СТАТИСТИКА КЛАСТЕРИЗАЦИИ")
+        print("="*50)
+        print(f"Всего диалогов: {len(results)}")
+        print(f"Количество кластеров: {len(cluster_analysis)}")
+        
+        print("\nРаспределение по кластерам:")
+        for cluster_id, analysis in sorted(cluster_analysis.items()):
+            print(f"  Кластер {cluster_id}: {analysis['size']} диалогов")
+            print(f"    Ключевые слова: {[word for word, count in analysis['keywords'][:3]]}")
+            if analysis['common_metkas']:
+                print(f"    Частые метки: {analysis['common_metkas']}")
+
+def main():
+    """
+    Основная функция кластеризации
+    """
+    # ==================== КОНФИГУРАЦИЯ ====================
+    CLUSTERING_FILE = "clustering_data.json"       # Файл для кластеризации
+    FIRST_MESSAGES_FILE = "first_messages.json"    # Файл с первыми сообщениями
+    OUTPUT_FILE = "clustering_results.json"        # Результаты кластеризации
+    NUM_CLUSTERS = None                            # Автоопределение если None
+    # ======================================================
+    
+    # Инициализация кластеризатора
+    clusterer = AdvancedTopicClustering()
+    
+    # Загрузка данных
+    texts, dialog_info = clusterer.load_clustering_data(CLUSTERING_FILE)
+    first_messages = clusterer.load_first_messages(FIRST_MESSAGES_FILE)
+    
+    if len(texts) < 3:
+        print("Недостаточно данных для кластеризации (нужно минимум 3 текста)")
+        return
+    
+    # Создание эмбеддингов
+    embeddings = clusterer.create_embeddings(texts)
+    
+    # Определение количества кластеров
+    if NUM_CLUSTERS is None:
+        NUM_CLUSTERS = clusterer.find_optimal_clusters(embeddings)
+    
+    # Кластеризация
+    labels, kmeans = clusterer.perform_clustering(embeddings, NUM_CLUSTERS)
+    
+    # Анализ кластеров
+    cluster_analysis = clusterer.analyze_clusters(texts, labels, first_messages)
+    
+    # Сохранение результатов
+    clusterer.save_results(
+        [dict(**info, text=text) for text, info in zip(texts, dialog_info)],
+        labels, 
+        cluster_analysis, 
+        OUTPUT_FILE
+    )
+    
+    print(f"\nКластеризация завершена! Результаты сохранены в {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
