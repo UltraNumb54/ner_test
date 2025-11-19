@@ -1,244 +1,134 @@
-# preprocess_data.py
-import pandas as pd
-import numpy as np
+# preprocess_punctuation.py
 import json
-import ast
-from sklearn.model_selection import train_test_split
-from collections import Counter
-import os
 import re
 
-def load_and_validate_data(csv_path):
+def separate_punctuation(text):
     """
-    Загрузка и валидация данных из CSV
+    Разделяет пунктуацию и специальные символы в тексте пробелами
     """
-    print("Загрузка данных...")
-    print(f"Путь к CSV: {os.path.abspath(csv_path)}")
+    if not text or not isinstance(text, str):
+        return text
     
-    try:
-        df = pd.read_csv(csv_path)
-        print(f"Успешно загружено {len(df)} строк")
-    except Exception as e:
-        print(f"Ошибка загрузки CSV: {e}")
-        return None
+    # Паттерны для разделения
+    patterns = [
+        (r'([!?.,:;()"\-—–/\\])', r' \1 '),  # Основная пунктуация и дефисы
+        (r'(\d)([.,])(\d)', r'\1 \2 \3'),    # Числа с разделителями
+        (r'([a-zA-Zа-яА-Я])(\-)([a-zA-Zа-яА-Я])', r'\1 \2 \3'),  # Дефисы между буквами
+        (r'\s+', ' '),  # Убираем лишние пробелы
+    ]
     
-    # Проверяем наличие необходимых колонок
-    required_columns = ['dialog_id', 'dialog_message_index', 'original_text', 'tokens', 'ner_tags', 'success']
-    print("Найденные колонки:", df.columns.tolist())
+    # Применяем все паттерны последовательно
+    processed_text = text
+    for pattern, replacement in patterns:
+        processed_text = re.sub(pattern, replacement, processed_text)
     
-    missing_columns = [col for col in required_columns if col not in df.columns]
+    # Финальная очистка пробелов
+    processed_text = re.sub(r'\s+', ' ', processed_text).strip()
     
-    if missing_columns:
-        print(f"Отсутствуют колонки: {missing_columns}")
-        return None
-    
-    # Оставляем только успешные примеры
-    df = df[df['success'] == True]
-    print(f"Успешных примеров: {len(df)}")
-    
-    return df
+    return processed_text
 
-def parse_list_column(column_data):
+def process_json_file(input_file, output_file):
     """
-    Парсинг столбца с списками (токены или NER теги)
+    Обрабатывает JSON файл, разделяя пунктуацию в текстах
     """
-    try:
-        if isinstance(column_data, list):
-            return column_data
-        elif isinstance(column_data, str):
-            # Пробуем JSON парсинг
-            try:
-                return json.loads(column_data)
-            except json.JSONDecodeError:
-                # Пробуем ast.literal_eval для списков в виде строк
-                try:
-                    return ast.literal_eval(column_data)
-                except:
-                    # Простой split для строк вида "B-FIO,I-FIO,O"
-                    if ',' in column_data:
-                        return [tag.strip().replace("'", "").replace('"', '') 
-                               for tag in column_data.strip('[]').split(',')]
-        return []
-    except Exception as e:
-        print(f"Ошибка парсинга данных: {e}")
-        return []
+    print(f"Чтение файла: {input_file}")
+    
+    with open(input_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    print(f"Обработка {len(data)} диалогов...")
+    
+    processed_data = []
+    
+    for dialog in data:
+        processed_dialog = dialog.copy()
+        
+        if 'dialogue' in dialog:
+            processed_dialogue = []
+            
+            for message in dialog['dialogue']:
+                processed_message = message.copy()
+                
+                if 'text' in message and message['text']:
+                    # Разделяем текст на строки и обрабатываем каждую
+                    lines = message['text'].split('\n')
+                    processed_lines = []
+                    
+                    for line in lines:
+                        if line.strip():
+                            processed_line = separate_punctuation(line)
+                            processed_lines.append(processed_line)
+                        else:
+                            processed_lines.append(line)
+                    
+                    processed_message['text'] = '\n'.join(processed_lines)
+                
+                processed_dialogue.append(processed_message)
+            
+            processed_dialog['dialogue'] = processed_dialogue
+        
+        processed_data.append(processed_dialog)
+    
+    # Сохраняем результат
+    print(f"Сохранение в: {output_file}")
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(processed_data, f, ensure_ascii=False, indent=2)
+    
+    # Показываем примеры преобразования
+    print("\nПримеры преобразования:")
+    for i, dialog in enumerate(data[:2]):  # Первые 2 диалога
+        if 'dialogue' in dialog:
+            for j, message in enumerate(dialog['dialogue'][:2]):  # Первые 2 сообщения
+                if 'text' in message:
+                    original = message['text']
+                    processed = processed_data[i]['dialogue'][j]['text']
+                    print(f"Оригинал: '{original}'")
+                    print(f"Обработано: '{processed}'")
+                    print()
+    
+    return processed_data
 
-def create_label_mapping(df):
+def test_separate_punctuation():
     """
-    Создание маппинга меток
+    Тестирование функции разделения пунктуации
     """
-    print("\nСоздание маппинга меток...")
-    all_tags = []
+    test_cases = [
+        "Добрый день!",
+        "НМ-120303.12",
+        "НМ-120303,12",
+        "Привет, как дела?",
+        "Стоимость: 1000.50 руб.",
+        "Телефон: +7(123)456-78-90",
+        "Адрес: ул.Ленина, д.25, кв.12",
+        "Время: 12:30-13:45",
+    ]
     
-    for tags_string in df['ner_tags']:
-        tags = parse_list_column(tags_string)
-        all_tags.extend(tags)
-    
-    # Уникальные метки (исключая -100 для игнорируемых токенов)
-    unique_tags = sorted(list(set([tag for tag in all_tags if tag != '-100'])))
-    
-    # Создаем маппинг
-    label2id = {tag: int(idx) for idx, tag in enumerate(unique_tags)}
-    id2label = {int(idx): tag for idx, tag in enumerate(unique_tags)}
-    
-    print(f"Уникальных меток: {len(unique_tags)}")
-    print("Маппинг label2id:", label2id)
-    
-    print("Распределение меток:")
-    tag_counts = Counter(all_tags)
-    for tag, count in tag_counts.most_common():
-        print(f"  {tag}: {count}")
-    
-    return label2id, id2label, unique_tags
-
-def prepare_training_examples(df, label2id):
-    """
-    Подготовка примеров для обучения
-    """
-    print("\nПодготовка тренировочных примеров...")
-    training_examples = []
-    skipped_count = 0
-    
-    for idx, row in df.iterrows():
-        try:
-            # Парсим готовые токены и метки
-            tokens = parse_list_column(row['tokens'])
-            ner_tags = parse_list_column(row['ner_tags'])
-            
-            # Проверяем, что оба списка не пустые
-            if not tokens or not ner_tags:
-                skipped_count += 1
-                continue
-            
-            # Проверяем соответствие количества токенов и меток
-            if len(tokens) != len(ner_tags):
-                print(f"Несоответствие в строке {idx}: {len(tokens)} токенов vs {len(ner_tags)} меток")
-                skipped_count += 1
-                continue
-            
-            # Преобразуем текстовые метки в числовые ID
-            label_ids = [label2id.get(tag, -100) for tag in ner_tags]
-            
-            training_examples.append({
-                'id': f"{row['dialog_id']}_{row['dialog_message_index']}",
-                'tokens': tokens,
-                'ner_tags': ner_tags,
-                'label_ids': label_ids,
-                'original_text': row['original_text']
-            })
-            
-        except Exception as e:
-            print(f"Ошибка в строке {idx}: {e}")
-            skipped_count += 1
-            continue
-    
-    print(f"Подготовлено примеров: {len(training_examples)}")
-    print(f"Пропущено примеров: {skipped_count}")
-    
-    return training_examples
-
-def split_data(examples, test_size=0.2, random_state=42):
-    """
-    Разделение данных на train/validation
-    """
-    print(f"\nРазделение {len(examples)} примеров...")
-    
-    if len(examples) == 0:
-        print("Нет примеров для разделения!")
-        return [], []
-    
-    train_examples, val_examples = train_test_split(
-        examples, 
-        test_size=test_size, 
-        random_state=random_state,
-        shuffle=True
-    )
-    
-    print(f"Train: {len(train_examples)} примеров")
-    print(f"Validation: {len(val_examples)} примеров")
-    
-    return train_examples, val_examples
-
-def save_processed_data(train_examples, val_examples, label2id, id2label, output_dir):
-    """
-    Сохранение обработанных данных
-    """
-    print(f"\nСохранение данных в {output_dir}...")
-    
-    try:
-        os.makedirs(output_dir, exist_ok=True)
-        print(f"Директория создана: {output_dir}")
-    except Exception as e:
-        print(f"Ошибка создания директории: {e}")
-        return
-    
-    # Преобразуем ключи в строки для JSON совместимости
-    label2id_str = {k: v for k, v in label2id.items()}
-    id2label_str = {str(k): v for k, v in id2label.items()}
-    
-    # Сохраняем маппинг меток
-    with open(f'{output_dir}/label_mapping.json', 'w', encoding='utf-8') as f:
-        json.dump({
-            'label2id': label2id_str,
-            'id2label': id2label_str
-        }, f, ensure_ascii=False, indent=2)
-    
-    # Сохраняем тренировочные данные
-    with open(f'{output_dir}/train_data.json', 'w', encoding='utf-8') as f:
-        for example in train_examples:
-            f.write(json.dumps(example, ensure_ascii=False) + '\n')
-    
-    # Сохраняем валидационные данные
-    with open(f'{output_dir}/val_data.json', 'w', encoding='utf-8') as f:
-        for example in val_examples:
-            f.write(json.dumps(example, ensure_ascii=False) + '\n')
-    
-    print(f"Данные сохранены в {output_dir}/")
+    print("Тестирование функции разделения пунктуации:")
+    for test in test_cases:
+        result = separate_punctuation(test)
+        print(f"'{test}' -> '{result}'")
 
 def main():
     """
-    Основная функция предобработки
+    Основная функция
     """
     # ==================== КОНФИГУРАЦИЯ ====================
-    # Укажите здесь ваши пути
-    INPUT_CSV = "ner_dataset_preprocessed.csv"  # Путь к исходному CSV файлу
-    OUTPUT_DIR = "training_data"                # Директория для сохранения обработанных данных
+    INPUT_JSON = "input_data.json"          # Исходный JSON файл
+    OUTPUT_JSON = "processed_data.json"     # Обработанный JSON файл
+    RUN_TESTS = True                        # Запустить тесты
     # ======================================================
     
-    print("=" * 50)
-    print("ЗАПУСК ПРЕДОБРАБОТКИ ДАННЫХ")
-    print("=" * 50)
+    if RUN_TESTS:
+        test_separate_punctuation()
+        print("\n" + "="*50 + "\n")
     
-    # Загрузка данных
-    df = load_and_validate_data(INPUT_CSV)
-    
-    if df is None or len(df) == 0:
-        print("Нет данных для обработки!")
-        return
-    
-    # Создание маппинга меток
-    label2id, id2label, unique_tags = create_label_mapping(df)
-    
-    if not label2id:
-        print("Не удалось создать маппинг меток!")
-        return
-    
-    # Подготовка примеров
-    examples = prepare_training_examples(df, label2id)
-    
-    if not examples:
-        print("Нет примеров для обучения!")
-        return
-    
-    # Разделение данных
-    train_examples, val_examples = split_data(examples)
-    
-    # Сохранение результатов
-    save_processed_data(train_examples, val_examples, label2id, id2label, OUTPUT_DIR)
-    
-    print("\n" + "=" * 50)
-    print("ПРЕДОБРАБОТКА ЗАВЕРШЕНА!")
-    print("=" * 50)
+    try:
+        process_json_file(INPUT_JSON, OUTPUT_JSON)
+        print("Обработка завершена успешно!")
+    except FileNotFoundError:
+        print(f"Ошибка: файл {INPUT_JSON} не найден!")
+    except Exception as e:
+        print(f"Ошибка при обработке: {e}")
 
 if __name__ == "__main__":
     main()
