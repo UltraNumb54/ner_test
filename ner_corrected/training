@@ -1,4 +1,4 @@
-# training_improved.py
+# training_fixed.py
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
@@ -12,10 +12,11 @@ import json
 import numpy as np
 import evaluate
 import os
-from sklearn.utils.class_weight import compute_class_weight
+import warnings
+warnings.filterwarnings("ignore")
 
 class NERDataset(Dataset):
-    def __init__(self, examples, tokenizer, label2id, max_length=256):  # Увеличили max_length
+    def __init__(self, examples, tokenizer, label2id, max_length=256):
         self.examples = examples
         self.tokenizer = tokenizer
         self.label2id = label2id
@@ -36,8 +37,7 @@ class NERDataset(Dataset):
             padding='max_length',
             truncation=True,
             max_length=self.max_length,
-            return_tensors='pt',
-            return_offsets_mapping=True  # Добавили для отладки
+            return_tensors='pt'
         )
         
         # Выравнивание меток для BERT токенизации
@@ -63,9 +63,9 @@ class NERDataset(Dataset):
             'labels': torch.tensor(aligned_labels, dtype=torch.long)
         }
 
-def compute_metrics_improved(p, id2label):
+def compute_metrics_fixed(p, id2label):
     """
-    Улучшенная функция вычисления метрик для NER
+    Исправленная функция вычисления метрик для NER
     """
     predictions, labels = p
     predictions = np.argmax(predictions, axis=2)
@@ -85,55 +85,28 @@ def compute_metrics_improved(p, id2label):
                     pred_line.append(id2label[pred_str])
                     label_line.append(id2label[label_str])
         
-        true_predictions.append(pred_line)
-        true_labels.append(label_line)
+        if pred_line and label_line:  # Добавляем только непустые последовательности
+            true_predictions.append(pred_line)
+            true_labels.append(label_line)
+    
+    # Если нет валидных последовательностей, возвращаем нулевые метрики
+    if not true_predictions or not true_labels:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "accuracy": 0.0}
     
     # Загружаем метрику для NER
     try:
         metric = evaluate.load("seqeval")
         results = metric.compute(predictions=true_predictions, references=true_labels)
         
-        # Добавляем детальную статистику по классам
-        detailed_results = {
+        return {
             "precision": results["overall_precision"],
             "recall": results["overall_recall"],
             "f1": results["overall_f1"],
             "accuracy": results["overall_accuracy"],
         }
-        
-        # Добавляем метрики по каждому классу
-        for key, value in results.items():
-            if key not in ["overall_precision", "overall_recall", "overall_f1", "overall_accuracy"]:
-                if isinstance(value, dict):
-                    detailed_results[key] = value
-        
-        return detailed_results
-        
     except Exception as e:
         print(f"Ошибка при вычислении метрик: {e}")
         return {"f1": 0.0, "precision": 0.0, "recall": 0.0, "accuracy": 0.0}
-
-def calculate_class_weights(examples):
-    """
-    Вычисление весов классов для борьбы с дисбалансом
-    """
-    all_labels = []
-    for example in examples:
-        # Берем только реальные метки (не -100)
-        labels = [label for label in example['label_ids'] if label != -100]
-        all_labels.extend(labels)
-    
-    # Вычисляем веса классов
-    unique_labels = list(set(all_labels))
-    if len(unique_labels) > 1:
-        class_weights = compute_class_weight(
-            'balanced', 
-            classes=unique_labels, 
-            y=all_labels
-        )
-        return torch.tensor(class_weights, dtype=torch.float)
-    else:
-        return None
 
 def load_training_data(data_dir):
     """
@@ -170,14 +143,15 @@ def load_training_data(data_dir):
     
     return train_examples, val_examples, label2id, id2label
 
-def train_model_improved():
+def train_model_fixed():
     """
-    Улучшенная функция обучения модели
+    Исправленная функция обучения модели
     """
-    # Конфигурация
-    MODEL_NAME = "bert-base-multilingual-cased"  # Можно попробовать "cointegrated/rubert-tiny2" для русского
+    # ==================== КОНФИГУРАЦИЯ ====================
+    MODEL_NAME = "bert-base-multilingual-cased"
     DATA_DIR = "training_data"
-    OUTPUT_DIR = "ner-model-improved"
+    OUTPUT_DIR = "ner-model-final"
+    # ======================================================
     
     # Загрузка данных и маппинга меток
     train_examples, val_examples, label2id, id2label = load_training_data(DATA_DIR)
@@ -191,18 +165,14 @@ def train_model_improved():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     
     print("Загрузка модели...")
+    # Используем ignore_mismatched_sizes=False чтобы избежать предупреждений
     model = AutoModelForTokenClassification.from_pretrained(
         MODEL_NAME,
         num_labels=len(label2id),
         id2label=id2label,
-        label2id=label2id
+        label2id=label2id,
+        ignore_mismatched_sizes=False  # Изменили на False
     )
-    
-    # Вычисляем веса классов
-    class_weights = calculate_class_weights(train_examples)
-    if class_weights is not None:
-        print("Веса классов:", class_weights)
-        # Добавляем веса в модель (это потребует кастомной функции потерь)
     
     # Создание датасетов
     train_dataset = NERDataset(train_examples, tokenizer, label2id, max_length=256)
@@ -214,26 +184,25 @@ def train_model_improved():
         padding=True
     )
     
-    # Улучшенные аргументы обучения
+    # Исправленные аргументы обучения
     training_args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        evaluation_strategy="epoch",
-        learning_rate=2e-5,  # Уменьшили learning rate
-        per_device_train_batch_size=16,  # Увеличили batch size если позволяет память
-        per_device_eval_batch_size=16,
-        num_train_epochs=8,  # Увеличили количество эпох
+        evaluation_strategy="epoch",  # Используем старый параметр для совместимости
+        learning_rate=3e-5,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        num_train_epochs=6,  # Увеличили количество эпох
         weight_decay=0.01,
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         greater_is_better=True,
         logging_dir=f"{OUTPUT_DIR}/logs",
-        logging_steps=100,
+        logging_steps=50,
         report_to=None,
-        save_total_limit=3,
+        save_total_limit=2,
         dataloader_pin_memory=False,
-        warmup_steps=500,  # Добавили warmup
-        logging_first_step=True,
+        warmup_steps=100,  # Добавили warmup
         seed=42,  # Для воспроизводимости
     )
     
@@ -245,16 +214,16 @@ def train_model_improved():
         eval_dataset=val_dataset,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=lambda p: compute_metrics_improved(p, id2label),
+        compute_metrics=lambda p: compute_metrics_fixed(p, id2label),
     )
     
     # Запуск обучения
     print("Начало обучения...")
     try:
-        # Предварительная оценка до обучения
+        # Предварительная оценка
         print("Предварительная оценка...")
         initial_eval = trainer.evaluate()
-        print("Начальные метрики:", initial_eval)
+        print("Начальные метрики:", {k: v for k, v in initial_eval.items() if isinstance(v, (int, float))})
         
         # Обучение
         trainer.train()
@@ -263,7 +232,7 @@ def train_model_improved():
         final_eval = trainer.evaluate()
         print("Финальные метрики:")
         for key, value in final_eval.items():
-            if isinstance(value, float):
+            if isinstance(value, (int, float)):
                 print(f"  {key}: {value:.4f}")
         
         # Сохранение модели
@@ -289,4 +258,4 @@ def train_model_improved():
     return trainer
 
 if __name__ == "__main__":
-    train_model_improved()
+    train_model_fixed()
