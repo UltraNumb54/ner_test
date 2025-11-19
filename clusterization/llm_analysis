@@ -1,3 +1,565 @@
+# analyze_clusters_with_llm_final.py
+import json
+import os
+import re
+from vllm import LLM, SamplingParams
+import time
+from typing import Dict, List, Any
+from datetime import datetime
+
+class ClusterAnalyzer:
+    def __init__(self, model_path: str = "Qwen/Qwen2.5-7B-Instruct-AWQ"):
+        """
+        Инициализация анализатора кластеров с vLLM
+        """
+        print(f"Загрузка модели {model_path}...")
+        
+        self.llm = LLM(
+            model=model_path,
+            quantization="awq",
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.8,
+            max_model_len=8192
+        )
+        
+        self.sampling_params = SamplingParams(
+            temperature=0.3,
+            top_p=0.9,
+            max_tokens=2048,
+            stop=["<|im_end|>", "<|endoftext|>"]
+        )
+        
+        # Словарь для замены английских меток на русские
+        self.metka_translations = {
+            '[FIO]': '[ФИО]',
+            '[PHONE]': '[Телефон]',
+            '[PHONE_NUM]': '[Телефон]',
+            '[EMAIL]': '[Email]',
+            '[DATE]': '[Дата]',
+            '[SUM]': '[Сумма]',
+            '[ORG]': '[Организация]',
+            '[LOC]': '[Адрес]',
+            '[READINGS]': '[Показания]',
+            '[LK_NUM]': '[Номер лицевого счёта]'
+        }
+        
+        print("Модель загружена успешно!")
+    
+    def translate_and_merge_metkas(self, text: str) -> str:
+        """
+        Заменяет английские метки на русские и объединяет подряд идущие одинаковые метки
+        """
+        # Сначала заменяем все английские метки на русские
+        for eng_metka, rus_metka in self.metka_translations.items():
+            text = text.replace(eng_metka, rus_metka)
+        
+        # Объединяем подряд идущие одинаковые русские метки
+        for rus_metka in self.metka_translations.values():
+            # Регулярное выражение для поиска 2+ подряд идущих одинаковых меток
+            pattern = f'({re.escape(rus_metka)}\\s*)+'
+            # Заменяем на одну метку
+            text = re.sub(pattern, rus_metka + ' ', text)
+        
+        # Убираем лишние пробелы
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+    
+    def create_prompt(self, cluster_id: int, dialogs: List[Dict]) -> str:
+        """
+        Создание промпта для анализа кластера с переведенными метками
+        """
+        dialogs_text = ""
+        dialog_ids = []  # Сохраняем ID диалогов
+        
+        for i, dialog in enumerate(dialogs[:20]):
+            dialog_id = dialog.get('dialog_id', f'unknown_{i}')
+            dialog_ids.append(dialog_id)
+            
+            dialog_text = dialog.get('text', '') or dialog.get('full_text', '')
+            # Применяем перевод и объединение меток
+            processed_text = self.translate_and_merge_metkas(dialog_text)
+            
+            dialogs_text += f"Диалог {i+1} (ID: {dialog_id}):\n{processed_text}\n\n"
+        
+        prompt = f"""<|im_start|>system
+Ты - эксперт по анализу диалогов и созданию инструкций для AI-агентов. Тебе предоставлены 20 диалогов из одного кластера, которые имеют общие характеристики.
+
+ТВОЯ ЗАДАЧА:
+1. Проанализировать общие черты и тематику этих диалогов
+2. Придумать краткое и информативное название для этого класса диалогов
+3. Дать развернутое описание класса
+4. Сформулировать четкие инструкции для AI-агента, который будет обрабатывать подобные диалоги
+
+ЭТИ ДАННЫЕ БУДУТ ИСПОЛЬЗОВАНЫ ДЛЯ:
+- Создания системы классификации диалогов
+- Написания инструкций для AI-агентов
+- Обучения моделей понимания намерений пользователей
+
+ВАЖНО: Не используй теги <think> или другие разметки для размышлений в ответе.
+
+ДИАЛОГИ КЛАСТЕРА {cluster_id}:
+{dialogs_text}
+
+ФОРМАТ ОТВЕТА (СОБЛЮДАЙ СТРОГО!):
+Название класса: [краткое информативное название]
+Описание класса: [развернутое описание общих характеристик, тематики, типичных запросов]
+Ключевые характеристики: [3-5 основных особенностей]
+Типичные сценарии: [3-5 типичных сценариев взаимодействия]
+Инструкции для агента:
+1. [конкретная инструкция]
+2. [конкретная инструкция]
+3. [конкретная инструкция]
+[дополнительные инструкции по необходимости]
+<|im_end|>
+<|im_start|>user
+Проанализируй предоставленные диалоги и предоставь ответ в указанном формате.<|im_end|>
+<|im_start|>assistant
+"""
+        return prompt, dialog_ids
+    
+    def remove_think_tags(self, text: str) -> str:
+        """
+        Удаляет все содержимое между <think> и </think> тегами
+        """
+        cleaned_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        cleaned_text = re.sub(r'<think>.*?$', '', cleaned_text, flags=re.DOTALL)
+        cleaned_text = re.sub(r'^.*?</think>', '', cleaned_text, flags=re.DOTALL)
+        return cleaned_text.strip()
+    
+    def clean_response(self, response: str) -> str:
+        """
+        Очистка ответа от нежелательных тегов и разметки
+        """
+        response = self.remove_think_tags(response)
+        response = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', response, flags=re.DOTALL)
+        response = re.sub(r'<\/?[a-zA-Z]+>', '', response)
+        response = re.sub(r'\n\s*\n', '\n\n', response)
+        return response.strip()
+    
+    def analyze_cluster(self, cluster_id: int, dialogs: List[Dict]) -> Dict[str, Any]:
+        """
+        Анализ одного кластера с помощью LLM
+        """
+        print(f"Анализ кластера {cluster_id}...")
+        
+        try:
+            prompt, dialog_ids = self.create_prompt(cluster_id, dialogs)
+            outputs = self.llm.generate([prompt], self.sampling_params)
+            raw_response = outputs[0].outputs[0].text
+            
+            cleaned_response = self.clean_response(raw_response)
+            analysis = self.parse_structured_response(cleaned_response, cluster_id)
+            
+            # Сохраняем дополнительную информацию
+            analysis['raw_response_cleaned'] = cleaned_response
+            analysis['dialog_ids'] = dialog_ids  # Сохраняем ID диалогов
+            analysis['cluster_stats'] = {
+                'total_dialogs_analyzed': len(dialogs),
+                'cluster_id': cluster_id,
+                'avg_dialog_length': sum(len(d.get('text', '') or d.get('full_text', '')) for d in dialogs) / len(dialogs) if dialogs else 0,
+                'analyzed_dialog_count': len(dialog_ids)
+            }
+            
+            print(f"Кластер {cluster_id} проанализирован успешно!")
+            return analysis
+            
+        except Exception as e:
+            print(f"Ошибка при анализе кластера {cluster_id}: {e}")
+            return self.create_error_response(cluster_id, dialogs, str(e))
+    
+    def create_error_response(self, cluster_id: int, dialogs: List[Dict], error_msg: str) -> Dict[str, Any]:
+        """
+        Создание ответа об ошибке
+        """
+        dialog_ids = [d.get('dialog_id', f'unknown_{i}') for i, d in enumerate(dialogs[:20])]
+        
+        return {
+            'cluster_name': f"Кластер_{cluster_id}_Ошибка",
+            'description': f"Ошибка анализа: {error_msg}",
+            'key_characteristics': [],
+            'typical_scenarios': [],
+            'agent_instructions': [],
+            'raw_response_cleaned': f"Ошибка: {error_msg}",
+            'dialog_ids': dialog_ids,
+            'cluster_stats': {
+                'total_dialogs_analyzed': len(dialogs),
+                'cluster_id': cluster_id,
+                'avg_dialog_length': 0,
+                'analyzed_dialog_count': len(dialog_ids)
+            }
+        }
+    
+    def parse_structured_response(self, response: str, cluster_id: int) -> Dict[str, Any]:
+        """
+        Парсинг структурированного ответа от модели
+        """
+        parsed = {
+            'cluster_name': f"Кластер_{cluster_id}",
+            'description': '',
+            'key_characteristics': [],
+            'typical_scenarios': [],
+            'agent_instructions': []
+        }
+        
+        try:
+            # Извлекаем название класса
+            name_match = re.search(r'Название класса:\s*(.+)', response)
+            if name_match:
+                parsed['cluster_name'] = name_match.group(1).strip()
+            
+            # Извлекаем описание
+            desc_match = re.search(r'Описание класса:\s*(.+?)(?=Ключевые характеристики:|Типичные сценарии:|Инструкции для агента:|$)', response, re.DOTALL)
+            if desc_match:
+                parsed['description'] = desc_match.group(1).strip()
+            
+            # Извлекаем ключевые характеристики
+            chars_match = re.search(r'Ключевые характеристики:\s*(.+?)(?=Типичные сценарии:|Инструкции для агента:|$)', response, re.DOTALL)
+            if chars_match:
+                chars_text = chars_match.group(1)
+                characteristics = self.parse_list_items(chars_text)
+                parsed['key_characteristics'] = characteristics
+            
+            # Извлекаем типичные сценарии
+            scenarios_match = re.search(r'Типичные сценарии:\s*(.+?)(?=Инструкции для агента:|$)', response, re.DOTALL)
+            if scenarios_match:
+                scenarios_text = scenarios_match.group(1)
+                scenarios = self.parse_list_items(scenarios_text)
+                parsed['typical_scenarios'] = scenarios
+            
+            # Извлекаем инструкции для агента
+            instructions_match = re.search(r'Инструкции для агента:\s*(.+)', response, re.DOTALL)
+            if instructions_match:
+                instructions_text = instructions_match.group(1)
+                instructions = self.parse_list_items(instructions_text)
+                parsed['agent_instructions'] = instructions
+            
+        except Exception as e:
+            print(f"Ошибка парсинга ответа для кластера {cluster_id}: {e}")
+            parsed['raw_response_cleaned'] = response
+        
+        return parsed
+    
+    def parse_list_items(self, text: str) -> List[str]:
+        """
+        Парсит элементы списка из текста
+        """
+        items = []
+        lines = text.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if line:
+                clean_line = re.sub(r'^[-\d•\.\s]+', '', line).strip()
+                if clean_line and len(clean_line) > 3:
+                    items.append(clean_line)
+        
+        return items[:10]
+    
+    def analyze_all_clusters(self, clusters_data: Dict, output_base_name: str):
+        """
+        Анализ всех кластеров и сохранение в JSON и TXT
+        """
+        print(f"Начало анализа {len(clusters_data)} кластеров...")
+        
+        results = {}
+        
+        for cluster_id, dialogs in clusters_data.items():
+            analysis = self.analyze_cluster(cluster_id, dialogs)
+            results[cluster_id] = analysis
+            time.sleep(1)
+        
+        self.save_json_results(results, f"{output_base_name}.json")
+        self.save_txt_results(results, f"{output_base_name}.txt")
+        
+        return results
+    
+    def save_json_results(self, results: Dict, output_file: str):
+        """
+        Сохранение результатов в JSON формате
+        """
+        print(f"Сохранение JSON результатов в {output_file}...")
+        
+        output_data = {
+            'analysis_timestamp': datetime.now().isoformat(),
+            'total_clusters_analyzed': len(results),
+            'model_used': 'Qwen2.5-7B-Instruct-AWQ',
+            'metka_translations_applied': self.metka_translations,
+            'clusters': results
+        }
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"JSON файл создан: {output_file}")
+    
+    def save_txt_results(self, results: Dict, output_file: str):
+        """
+        Сохранение результатов в читаемом TXT формате
+        """
+        print(f"Сохранение TXT результатов в {output_file}...")
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("АНАЛИЗ КЛАСТЕРОВ ДИАЛОГОВ\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Время анализа: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Количество кластеров: {len(results)}\n")
+            f.write(f"Модель: Qwen2.5-7B-Instruct-AWQ\n")
+            f.write(f"Применены переводы меток: {', '.join(self.metka_translations.values())}\n\n")
+            
+            for cluster_id, analysis in results.items():
+                f.write(f"КЛАСТЕР {cluster_id}: {analysis.get('cluster_name', 'Нет названия')}\n")
+                f.write("=" * 60 + "\n")
+                
+                stats = analysis.get('cluster_stats', {})
+                f.write(f"СТАТИСТИКА: {stats.get('analyzed_dialog_count', 0)} диалогов (всего: {stats.get('total_dialogs_analyzed', 0)})\n")
+                
+                # Выводим ID диалогов
+                dialog_ids = analysis.get('dialog_ids', [])
+                if dialog_ids:
+                    f.write(f"АНАЛИЗИРОВАННЫЕ ДИАЛОГИ (ID): {', '.join(map(str, dialog_ids))}\n")
+                f.write("\n")
+                
+                f.write("ОПИСАНИЕ КЛАССА:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"{analysis.get('description', 'Нет описания')}\n\n")
+                
+                f.write("КЛЮЧЕВЫЕ ХАРАКТЕРИСТИКИ:\n")
+                f.write("-" * 40 + "\n")
+                for i, char in enumerate(analysis.get('key_characteristics', []), 1):
+                    f.write(f"{i}. {char}\n")
+                if not analysis.get('key_characteristics'):
+                    f.write("Нет характеристик\n")
+                f.write("\n")
+                
+                f.write("ТИПИЧНЫЕ СЦЕНАРИИ:\n")
+                f.write("-" * 40 + "\n")
+                for i, scenario in enumerate(analysis.get('typical_scenarios', []), 1):
+                    f.write(f"{i}. {scenario}\n")
+                if not analysis.get('typical_scenarios'):
+                    f.write("Нет сценариев\n")
+                f.write("\n")
+                
+                f.write("ИНСТРУКЦИИ ДЛЯ АГЕНТА:\n")
+                f.write("-" * 40 + "\n")
+                for i, instruction in enumerate(analysis.get('agent_instructions', []), 1):
+                    f.write(f"{i}. {instruction}\n")
+                if not analysis.get('agent_instructions'):
+                    f.write("Нет инструкций\n")
+                f.write("\n")
+                
+                f.write("ПОЛНЫЙ ОТВЕТ МОДЕЛИ (очищенный):\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"{analysis.get('raw_response_cleaned', 'Нет ответа')}\n")
+                
+                f.write("\n" + "=" * 80 + "\n\n")
+        
+        print(f"TXT файл создан: {output_file}")
+
+def load_cluster_data(input_file: str) -> Dict:
+    """
+    Загрузка данных кластеров
+    """
+    print(f"Загрузка данных из {input_file}...")
+    
+    with open(input_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    clusters = {}
+    
+    if isinstance(data, list):
+        for item in data:
+            cluster_id = item.get('cluster_id')
+            if cluster_id not in clusters:
+                clusters[cluster_id] = []
+            clusters[cluster_id].append(item)
+    elif isinstance(data, dict):
+        clusters = data
+    
+    print(f"Загружено {len(clusters)} кластеров")
+    
+    for cluster_id, dialogs in clusters.items():
+        print(f"  Кластер {cluster_id}: {len(dialogs)} диалогов")
+    
+    return clusters
+
+def post_process_files(output_base_name: str):
+    """
+    Пост-обработка файлов для удаления оставшихся think тегов
+    """
+    json_file = f"{output_base_name}.json"
+    txt_file = f"{output_base_name}.txt"
+    
+    print("Пост-обработка файлов для удаления think тегов...")
+    
+    def remove_think_tags(text):
+        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    
+    # Обработка JSON файла
+    if os.path.exists(json_file):
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        def clean_json(obj):
+            if isinstance(obj, dict):
+                return {k: clean_json(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [clean_json(item) for item in obj]
+            elif isinstance(obj, str):
+                return remove_think_tags(obj)
+            else:
+                return obj
+        
+        cleaned_data = clean_json(data)
+        
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"JSON файл очищен: {json_file}")
+    
+    # Обработка TXT файла
+    if os.path.exists(txt_file):
+        with open(txt_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        cleaned_content = remove_think_tags(content)
+        
+        with open(txt_file, 'w', encoding='utf-8') as f:
+            f.write(cleaned_content)
+        
+        print(f"TXT файл очищен: {txt_file}")
+
+def main():
+    """
+    Основная функция
+    """
+    # ==================== КОНФИГУРАЦИЯ ====================
+    INPUT_FILE = "top_20_per_class.json"
+    OUTPUT_BASE_NAME = "cluster_analysis_final"
+    MODEL_PATH = "Qwen/Qwen2.5-7B-Instruct-AWQ"
+    # ======================================================
+    
+    print("=" * 60)
+    print("АНАЛИЗ КЛАСТЕРОВ С ПЕРЕВОДОМ МЕТОК И ID ДИАЛОГОВ")
+    print("=" * 60)
+    
+    if not os.path.exists(INPUT_FILE):
+        print(f"Ошибка: файл {INPUT_FILE} не найден!")
+        return
+    
+    try:
+        clusters_data = load_cluster_data(INPUT_FILE)
+        
+        if not clusters_data:
+            print("Нет данных для анализа!")
+            return
+        
+        analyzer = ClusterAnalyzer(MODEL_PATH)
+        results = analyzer.analyze_all_clusters(clusters_data, OUTPUT_BASE_NAME)
+        post_process_files(OUTPUT_BASE_NAME)
+        
+        print(f"\nАнализ завершен! Результаты сохранены в:")
+        print(f"  {OUTPUT_BASE_NAME}.json - структурированные данные с ID диалогов")
+        print(f"  {OUTPUT_BASE_NAME}.txt - читаемое описание с ID диалогов")
+        
+    except Exception as e:
+        print(f"Ошибка при выполнении анализа: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
+
+# create_top_20_per_class_improved.py
+import json
+import os
+from collections import defaultdict
+
+def create_top_20_file(clustering_results_file: str, output_file: str):
+    """
+    Создает файл с топ-20 диалогами каждого класса с сохранением ID
+    """
+    print(f"Чтение файла кластеризации: {clustering_results_file}")
+    
+    if not os.path.exists(clustering_results_file):
+        print(f"Ошибка: файл {clustering_results_file} не найден!")
+        return
+    
+    with open(clustering_results_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    clusters = defaultdict(list)
+    
+    # Обрабатываем разные форматы входных данных
+    if isinstance(data, list):
+        for item in data:
+            cluster_id = item.get('cluster_id')
+            if cluster_id is not None:
+                # Убедимся, что у каждого диалога есть dialog_id
+                if 'dialog_id' not in item:
+                    item['dialog_id'] = f"cluster_{cluster_id}_{len(clusters[cluster_id])}"
+                clusters[cluster_id].append(item)
+    elif isinstance(data, dict) and 'clusters' in data:
+        clusters = data['clusters']
+    elif isinstance(data, dict):
+        clusters = data
+    
+    print(f"Найдено {len(clusters)} кластеров")
+    
+    # Для каждого кластера берем топ-20 диалогов
+    top_20_per_class = {}
+    
+    for cluster_id, dialogs in clusters.items():
+        if isinstance(dialogs, list):
+            # Сортируем по длине текста и берем топ-20
+            sorted_dialogs = sorted(dialogs, key=lambda x: len(x.get('text', '') or x.get('full_text', '')), reverse=True)
+            top_20_per_class[cluster_id] = sorted_dialogs[:20]
+        else:
+            top_20_per_class[cluster_id] = list(dialogs.values())[:20] if isinstance(dialogs, dict) else []
+        
+        # Проверяем, что у всех диалогов есть ID
+        for i, dialog in enumerate(top_20_per_class[cluster_id]):
+            if 'dialog_id' not in dialog:
+                dialog['dialog_id'] = f"cluster_{cluster_id}_{i}"
+        
+        print(f"Кластер {cluster_id}: {len(top_20_per_class[cluster_id])} диалогов")
+    
+    # Сохраняем результат
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(top_20_per_class, f, ensure_ascii=False, indent=2)
+    
+    # Статистика
+    total_dialogs = sum(len(dialogs) for dialogs in top_20_per_class.values())
+    print(f"Файл с топ-20 диалогами сохранен: {output_file}")
+    print(f"Всего диалогов для анализа: {total_dialogs}")
+    
+    # Проверяем наличие ID
+    missing_ids = 0
+    for cluster_id, dialogs in top_20_per_class.items():
+        for dialog in dialogs:
+            if 'dialog_id' not in dialog:
+                missing_ids += 1
+    
+    if missing_ids > 0:
+        print(f"Предупреждение: {missing_ids} диалогов без ID!")
+    else:
+        print("Все диалоги имеют ID")
+
+def main():
+    """
+    Основная функция создания файла с топ-20
+    """
+    # ==================== КОНФИГУРАЦИЯ ====================
+    CLUSTERING_RESULTS_FILE = "clustering_results.json"
+    OUTPUT_FILE = "top_20_per_class.json"
+    # ======================================================
+    
+    create_top_20_file(CLUSTERING_RESULTS_FILE, OUTPUT_FILE)
+
+if __name__ == "__main__":
+    main()
+
+
 # test_metka_translation.py
 import re
 
