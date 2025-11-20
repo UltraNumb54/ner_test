@@ -1,13 +1,11 @@
-# improved_first_message_clustering.py
+# gmm_first_message_clustering.py
 import json
 import pandas as pd
 import numpy as np
 from sentence_transformers import SentenceTransformer
-from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.mixture import GaussianMixture
-from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+from sklearn.metrics import silhouette_score
 from sklearn.decomposition import PCA
-from sklearn.neighbors import NearestNeighbors
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
@@ -15,15 +13,25 @@ import re
 from tqdm import tqdm
 import os
 import pymorphy3
-import hdbscan
-from umap import UMAP
+
+class NumpyEncoder(json.JSONEncoder):
+    """Кастомный JSON encoder для обработки numpy типов и bool"""
+    def default(self, obj):
+        if isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        if isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
 
 class RussianTextPreprocessor:
     """Класс для предобработки русского текста с лемматизацией"""
     
     def __init__(self):
         self.morph = pymorphy3.MorphAnalyzer()
-        # Базовый список стоп-слов (можно расширить при необходимости)
         self.stop_words = {
             'это', 'как', 'так', 'и', 'в', 'над', 'к', 'до', 'не', 'на', 'но', 'за', 'то', 'с', 'ли', 'а', 'во', 'от',
             'со', 'для', 'о', 'же', 'ну', 'вы', 'бы', 'что', 'кто', 'он', 'она', 'они', 'мы', 'вас', 'их', 'его', 'её',
@@ -32,16 +40,8 @@ class RussianTextPreprocessor:
             'как', 'сколько', 'тот', 'этот', 'такой', 'вот', 'тут', 'здесь', 'там', 'тогда', 'поэтому', 'итак', 'однако',
             'может', 'конечно', 'вероятно', 'точно', 'просто', 'особенно', 'очень', 'слишком', 'совсем', 'чуть', 'почти',
             'именно', 'только', 'лишь', 'еще', 'уже', 'тоже', 'также', 'все', 'всё', 'весь', 'вся', 'каждый', 'любой',
-            'самый', 'другой', 'иной', 'последний', 'первый', 'год', 'лет', 'время', 'раз', 'человек', 'дело', 'жизнь',
-            'день', 'рука', 'работа', 'слово', 'место', 'лицо', 'друг', 'глаз', 'вопрос', 'дом', 'сторона', 'страна',
-            'мир', 'случай', 'голова', 'ребенок', 'сила', 'конец', 'вид', 'система', 'часть', 'город', 'отношение',
-            'женщина', 'деньги', 'земля', 'машина', 'вода', 'отец', 'проблема', 'час', 'право', 'нога', 'решение',
-            'дверь', 'образ', 'история', 'власть', 'закон', 'война', 'голос', 'тысяча', 'книга', 'возможность',
-            'результат', 'ночь', 'стол', 'имя', 'область', 'статья', 'число', 'компания', 'народ', 'жена', 'группа',
-            'развитие', 'процесс', 'суд', 'условие', 'средство', 'начало', 'свет', 'пора', 'путь', 'душа', 'уровень',
-            'форма', 'связь', 'минута', 'улица', 'вечер', 'качество', 'мысль', 'дорога', 'мать', 'действие', 'месяц',
-            'государство', 'язык', 'любовь', 'взгляд', 'мама', 'век', 'школа', 'цель', 'общество', 'деятельность',
-            'пожалуйста', 'здравствуйте', 'спасибо', 'помощь', 'информация', 'помогите', 'подскажите', 'скажите'
+            'самый', 'другой', 'иной', 'последний', 'первый', 'пожалуйста', 'здравствуйте', 'спасибо', 'помощь', 
+            'информация', 'помогите', 'подскажите', 'скажите'
         }
     
     def lemmatize_text(self, text):
@@ -67,10 +67,10 @@ class RussianTextPreprocessor:
         """Предобработка батча текстов"""
         return [self.lemmatize_text(text) for text in texts]
 
-class ImprovedFirstMessageClustering:
+class GMMFirstMessageClustering:
     def __init__(self, model_name='sentence-transformers/paraphrase-multilingual-mpnet-base-v2'):
         """Инициализация с улучшенной моделью"""
-        print(f"Загрузка улучшенной модели {model_name}")
+        print(f"Загрузка модели {model_name}")
         self.model = SentenceTransformer(model_name)
         self.preprocessor = RussianTextPreprocessor()
         print("Модель и препроцессор загружены успешно")
@@ -128,146 +128,118 @@ class ImprovedFirstMessageClustering:
             batch_size=batch_size,
             show_progress_bar=True,
             convert_to_numpy=True,
-            normalize_embeddings=True  # Нормализация для лучшей кластеризации
+            normalize_embeddings=True
         )
         
         print(f"Создано эмбеддингов: {embeddings.shape}")
         return embeddings
     
-    def find_optimal_k(self, embeddings, max_k=15):
-        """Поиск оптимального количества кластеров для алгоритмов, требующих k"""
+    def find_optimal_clusters_gmm(self, embeddings, max_k=15):
+        """Поиск оптимального количества кластеров для GMM с использованием BIC и силуэтного анализа"""
+        print("Поиск оптимального количества кластеров для GMM...")
+        
         if len(embeddings) < 3:
             return 2
         
+        bic_scores = []
         silhouette_scores = []
-        k_range = range(2, min(max_k + 1, len(embeddings)))
+        k_range = range(1, min(max_k + 1, len(embeddings)))
         
-        for k in k_range:
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(embeddings)
-            
-            if len(set(labels)) > 1:
-                score = silhouette_score(embeddings, labels)
-                silhouette_scores.append(score)
-            else:
+        for k in tqdm(k_range, desc="Анализ кластеров GMM"):
+            try:
+                gmm = GaussianMixture(n_components=k, random_state=42, n_init=3)
+                labels = gmm.fit_predict(embeddings)
+                bic_scores.append(gmm.bic(embeddings))
+                
+                if len(set(labels)) > 1:
+                    score = silhouette_score(embeddings, labels)
+                    silhouette_scores.append(score)
+                else:
+                    silhouette_scores.append(0)
+            except Exception as e:
+                print(f"Ошибка при k={k}: {e}")
+                bic_scores.append(np.inf)
                 silhouette_scores.append(0)
         
-        optimal_k = k_range[np.argmax(silhouette_scores)]
-        print(f"Оптимальное k (силуэтный анализ): {optimal_k}")
+        # Находим оптимальное k по BIC (минимум) и силуэту (максимум)
+        if len(bic_scores) > 1:
+            # Исключаем k=1 для BIC анализа
+            bic_k = np.argmin(bic_scores[1:]) + 2 if len(bic_scores) > 1 else 2
+        else:
+            bic_k = 2
+            
+        if len(silhouette_scores) > 1:
+            silhouette_k = np.argmax(silhouette_scores[1:]) + 2 if len(silhouette_scores) > 1 else 2
+        else:
+            silhouette_k = 2
+        
+        # Выбираем оптимальное k (предпочтение силуэтному анализу для кластеризации)
+        optimal_k = silhouette_k
+        
+        print(f"Оптимальное количество кластеров:")
+        print(f"  BIC анализ: {bic_k}")
+        print(f"  Силуэтный анализ: {silhouette_k}")
+        print(f"  Выбрано: {optimal_k}")
+        
+        # Визуализация выбора k
+        self._plot_optimal_clusters_gmm(k_range, bic_scores, silhouette_scores, bic_k, silhouette_k)
+        
         return optimal_k
     
-    def find_epsilon_for_dbscan(self, embeddings, k=5):
-        """Поиск оптимального epsilon для DBSCAN"""
-        neighbors = NearestNeighbors(n_neighbors=k)
-        neighbors_fit = neighbors.fit(embeddings)
-        distances, indices = neighbors_fit.kneighbors(embeddings)
-        distances = np.sort(distances[:, k-1], axis=0)
+    def _plot_optimal_clusters_gmm(self, k_range, bic_scores, silhouette_scores, bic_k, silhouette_k):
+        """Визуализация выбора оптимального количества кластеров для GMM"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
         
-        # Ищем "локоть" на графике расстояний
-        gradients = np.diff(distances)
-        optimal_idx = np.argmax(gradients) + 1
-        epsilon = distances[optimal_idx]
+        # График BIC
+        ax1.plot(k_range, bic_scores, 'bo-')
+        ax1.axvline(x=bic_k, color='red', linestyle='--', alpha=0.7, label=f'Оптимум BIC: k={bic_k}')
+        ax1.set_xlabel('Количество кластеров')
+        ax1.set_ylabel('BIC Score')
+        ax1.set_title('BIC анализ для GMM')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
         
-        print(f"Оптимальный epsilon для DBSCAN: {epsilon:.4f}")
-        return epsilon
+        # График силуэтного анализа
+        ax2.plot(k_range, silhouette_scores, 'go-')
+        ax2.axvline(x=silhouette_k, color='red', linestyle='--', alpha=0.7, label=f'Оптимум силуэта: k={silhouette_k}')
+        ax2.set_xlabel('Количество кластеров')
+        ax2.set_ylabel('Silhouette Score')
+        ax2.set_title('Силуэтный анализ для GMM')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('gmm_optimal_k.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print("График выбора оптимального k сохранен: gmm_optimal_k.png")
     
-    def compare_clustering_algorithms(self, embeddings):
-        """Сравнение разных алгоритмов кластеризации"""
-        print("\nСравнение алгоритмов кластеризации...")
+    def perform_gmm_clustering(self, embeddings, n_components=None):
+        """Выполнение кластеризации Gaussian Mixture Models"""
+        if n_components is None:
+            n_components = min(10, max(2, len(embeddings) // 10))
         
-        results = {}
+        print(f"Выполнение GMM кластеризации с {n_components} кластерами...")
         
-        # 1. HDBSCAN (рекомендуется для автоматического определения кластеров)
-        print("Запуск HDBSCAN...")
-        hdbscan_clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=5,
-            min_samples=3,
-            cluster_selection_epsilon=0.1,
-            metric='euclidean'
+        gmm = GaussianMixture(
+            n_components=n_components, 
+            random_state=42, 
+            n_init=5,
+            covariance_type='full'
         )
-        hdbscan_labels = hdbscan_clusterer.fit_predict(embeddings)
-        n_clusters_hdbscan = len(set(hdbscan_labels)) - (1 if -1 in hdbscan_labels else 0)
         
-        if n_clusters_hdbscan > 1:
-            hdbscan_silhouette = silhouette_score(embeddings, hdbscan_labels)
+        # Получаем метки кластеров и вероятности
+        labels = gmm.fit_predict(embeddings)
+        probabilities = gmm.predict_proba(embeddings)
+        
+        # Оценка качества
+        if len(set(labels)) > 1:
+            score = silhouette_score(embeddings, labels)
+            print(f"Silhouette Score: {score:.4f}")
         else:
-            hdbscan_silhouette = 0
+            print("Создан только один кластер")
         
-        results['HDBSCAN'] = {
-            'labels': hdbscan_labels,
-            'n_clusters': n_clusters_hdbscan,
-            'silhouette': hdbscan_silhouette,
-            'n_noise': np.sum(hdbscan_labels == -1)
-        }
-        
-        # 2. DBSCAN
-        print("Запуск DBSCAN...")
-        epsilon = self.find_epsilon_for_dbscan(embeddings)
-        dbscan = DBSCAN(eps=epsilon, min_samples=3, metric='euclidean')
-        dbscan_labels = dbscan.fit_predict(embeddings)
-        n_clusters_dbscan = len(set(dbscan_labels)) - (1 if -1 in dbscan_labels else 0)
-        
-        if n_clusters_dbscan > 1:
-            dbscan_silhouette = silhouette_score(embeddings, dbscan_labels)
-        else:
-            dbscan_silhouette = 0
-        
-        results['DBSCAN'] = {
-            'labels': dbscan_labels,
-            'n_clusters': n_clusters_dbscan,
-            'silhouette': dbscan_silhouette,
-            'n_noise': np.sum(dbscan_labels == -1)
-        }
-        
-        # 3. Agglomerative Clustering
-        print("Запуск Agglomerative Clustering...")
-        optimal_k = self.find_optimal_k(embeddings)
-        agglo = AgglomerativeClustering(n_clusters=optimal_k, metric='euclidean', linkage='ward')
-        agglo_labels = agglo.fit_predict(embeddings)
-        
-        if optimal_k > 1:
-            agglo_silhouette = silhouette_score(embeddings, agglo_labels)
-        else:
-            agglo_silhouette = 0
-        
-        results['Agglomerative'] = {
-            'labels': agglo_labels,
-            'n_clusters': optimal_k,
-            'silhouette': agglo_silhouette,
-            'n_noise': 0
-        }
-        
-        # 4. Gaussian Mixture Models
-        print("Запуск Gaussian Mixture Models...")
-        gmm = GaussianMixture(n_components=optimal_k, random_state=42, n_init=3)
-        gmm_labels = gmm.fit_predict(embeddings)
-        
-        if optimal_k > 1:
-            gmm_silhouette = silhouette_score(embeddings, gmm_labels)
-        else:
-            gmm_silhouette = 0
-        
-        results['GMM'] = {
-            'labels': gmm_labels,
-            'n_clusters': optimal_k,
-            'silhouette': gmm_silhouette,
-            'n_noise': 0
-        }
-        
-        # Вывод сравнения
-        print("\n" + "="*60)
-        print("СРАВНЕНИЕ АЛГОРИТМОВ КЛАСТЕРИЗАЦИИ")
-        print("="*60)
-        for algo, metrics in results.items():
-            print(f"{algo:15} | Кластеров: {metrics['n_clusters']:2} | "
-                  f"Silhouette: {metrics['silhouette']:.4f} | "
-                  f"Шум: {metrics['n_noise']}")
-        
-        # Выбор лучшего алгоритма
-        best_algo = max(results.items(), key=lambda x: x[1]['silhouette'] if x[1]['n_clusters'] > 1 else -1)
-        print(f"\nЛучший алгоритм: {best_algo[0]} (Silhouette: {best_algo[1]['silhouette']:.4f})")
-        
-        return results, best_algo[0]
+        return labels, gmm, probabilities
     
     def extract_keywords(self, texts, n_keywords=10):
         """Извлечение ключевых слов из текстов"""
@@ -290,9 +262,6 @@ class ImprovedFirstMessageClustering:
         cluster_analysis = {}
         
         for cluster_id in set(labels):
-            if cluster_id == -1:  # Пропускаем шум
-                continue
-                
             cluster_indices = [i for i, label in enumerate(labels) if label == cluster_id]
             cluster_texts = [texts[i] for i in cluster_indices]
             cluster_original = [original_texts[i] for i in cluster_indices]
@@ -330,52 +299,62 @@ class ImprovedFirstMessageClustering:
         
         return {k: v for k, v in metka_counts.items() if v > 0}
     
-    def visualize_results(self, embeddings, results, best_algo):
-        """Визуализация результатов всех алгоритмов"""
-        print("Создание визуализаций...")
+    def visualize_clusters(self, embeddings, labels, cluster_analysis):
+        """Визуализация кластеров GMM"""
+        print("Визуализация кластеров GMM...")
         
-        # UMAP для лучшей визуализации
-        umap_reducer = UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
-        embeddings_2d = umap_reducer.fit_transform(embeddings)
+        # PCA для визуализации
+        pca = PCA(n_components=2, random_state=42)
+        embeddings_2d = pca.fit_transform(embeddings)
         
-        fig, axes = plt.subplots(2, 2, figsize=(20, 16))
-        axes = axes.flatten()
+        # Создаем DataFrame для удобства построения графиков
+        df = pd.DataFrame({
+            'x': embeddings_2d[:, 0],
+            'y': embeddings_2d[:, 1],
+            'cluster': labels
+        })
         
-        algorithms = list(results.keys())
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
         
-        for idx, algo in enumerate(algorithms):
-            ax = axes[idx]
-            labels = results[algo]['labels']
-            
-            scatter = ax.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], 
-                               c=labels, cmap='tab10', alpha=0.7, s=50)
-            ax.set_title(f'{algo}\n'
-                        f'Кластеров: {results[algo]["n_clusters"]}, '
-                        f'Silhouette: {results[algo]["silhouette"]:.3f}\n'
-                        f'Шум: {results[algo]["n_noise"]}',
-                        fontsize=12, fontweight='bold' if algo == best_algo else 'normal')
-            ax.grid(True, alpha=0.3)
-            
-            # Добавляем цветовую легенду только если есть кластеры
-            unique_labels = set(labels)
-            if len(unique_labels) > 1:
-                plt.colorbar(scatter, ax=ax)
+        # 1. Точечная диаграмма кластеров
+        scatter = ax1.scatter(df['x'], df['y'], c=df['cluster'], cmap='tab10', alpha=0.7, s=50)
+        ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+        ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+        ax1.set_title('GMM кластеризация первых сообщений\n(PCA проекция)')
+        ax1.legend(*scatter.legend_elements(), title="Кластеры")
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. Размеры кластеров
+        cluster_sizes = {k: v['size'] for k, v in cluster_analysis.items()}
+        clusters = list(cluster_sizes.keys())
+        sizes = list(cluster_sizes.values())
+        
+        bars = ax2.bar(clusters, sizes, color=plt.cm.tab10(range(len(clusters))))
+        ax2.set_xlabel('Номер кластера')
+        ax2.set_ylabel('Количество диалогов')
+        ax2.set_title('Распределение диалогов по кластерам (GMM)')
+        
+        # Добавляем подписи на столбцах
+        for bar, size in zip(bars, sizes):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                    f'{size}', ha='center', va='bottom')
         
         plt.tight_layout()
-        plt.savefig('clustering_algorithms_comparison.png', dpi=300, bbox_inches='tight')
+        plt.savefig('gmm_clustering_visualization.png', dpi=300, bbox_inches='tight')
         plt.close()
         
-        print("Сравнительная визуализация сохранена: clustering_algorithms_comparison.png")
+        print("Графики кластеризации сохранены: gmm_clustering_visualization.png")
+        print(f"PCA объясненная дисперсия: PC1={pca.explained_variance_ratio_[0]:.2%}, PC2={pca.explained_variance_ratio_[1]:.2%}")
     
     def save_results(self, dialog_info, labels, cluster_analysis, output_file):
-        """Сохранение результатов кластеризации"""
+        """Сохранение результатов кластеризации с исправленной JSON сериализацией"""
         print("Сохранение результатов...")
         
         results = []
         for i, (item, label) in enumerate(zip(dialog_info, labels)):
             cluster_info = cluster_analysis.get(label, {'size': 0, 'keywords': []})
             
-            results.append({
+            result_item = {
                 'dialog_id': item['dialog_id'],
                 'cluster_id': int(label),
                 'cluster_size': cluster_info['size'],
@@ -383,12 +362,14 @@ class ImprovedFirstMessageClustering:
                 'full_dialog': item['full_dialog'],
                 'keywords': [word for word, count in cluster_info['keywords'][:5]],
                 'original_topic': item.get('original_topic', 'unknown'),
-                'source': item.get('source', 'unknown'),
-                'is_noise': (label == -1)
-            })
+                'source': item.get('source', 'unknown')
+            }
+            
+            # Явно преобразуем все numpy типы
+            results.append(json.loads(json.dumps(result_item, cls=NumpyEncoder)))
         
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+            json.dump(results, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
         
         self._print_statistics(results, cluster_analysis)
         
@@ -397,16 +378,12 @@ class ImprovedFirstMessageClustering:
     def _print_statistics(self, results, cluster_analysis):
         """Вывод статистики кластеризации"""
         print("\n" + "="*60)
-        print("СТАТИСТИКА КЛАСТЕРИЗАЦИИ ПО ПЕРВЫМ СООБЩЕНИЯМ")
+        print("СТАТИСТИКА КЛАСТЕРИЗАЦИИ GMM ПО ПЕРВЫМ СООБЩЕНИЯМ")
         print("="*60)
         
         total_dialogs = len(results)
-        noise_count = sum(1 for r in results if r['is_noise'])
-        clustered_count = total_dialogs - noise_count
         
         print(f"Всего диалогов: {total_dialogs}")
-        print(f"Успешно кластеризовано: {clustered_count}")
-        print(f"Не кластеризовано (шум): {noise_count}")
         print(f"Количество кластеров: {len(cluster_analysis)}")
         
         print("\nРаспределение по кластерам:")
@@ -421,25 +398,26 @@ class ImprovedFirstMessageClustering:
                 print(f"      {i+1}. {preview}")
 
 def main():
-    """Основная функция улучшенной кластеризации"""
+    """Основная функция кластеризации GMM по первым сообщениям"""
     
     # Конфигурация
     CLUSTERING_FILE = "clustering_data.json"
     ANALYSIS_FILE = "analysis_data_replaced.json"
-    OUTPUT_FILE = "improved_clustering_results_first_messages.json"
+    OUTPUT_FILE = "gmm_clustering_results_first_messages.json"
     
     print("=" * 60)
-    print("УЛУЧШЕННАЯ КЛАСТЕРИЗАЦИЯ ПО ПЕРВЫМ СООБЩЕНИЯМ")
+    print("GMM КЛАСТЕРИЗАЦИЯ ПО ПЕРВЫМ СООБЩЕНИЯМ")
     print("=" * 60)
-    print("Улучшения:")
+    print("Особенности:")
     print("  - Лемматизация русского текста")
     print("  - Модель: paraphrase-multilingual-mpnet-base-v2")
-    print("  - Сравнение 4 алгоритмов кластеризации")
-    print("  - Автоматический подбор параметров")
+    print("  - Gaussian Mixture Models (вероятностный подход)")
+    print("  - Автоматический подбор числа кластеров")
+    print("  - Исправленная JSON сериализация")
     print("=" * 60)
     
-    # Инициализация улучшенного кластеризатора
-    clusterer = ImprovedFirstMessageClustering()
+    # Инициализация кластеризатора
+    clusterer = GMMFirstMessageClustering()
     
     # Загрузка и предобработка данных
     processed_texts, original_texts, dialog_info = clusterer.load_data(CLUSTERING_FILE, ANALYSIS_FILE)
@@ -451,23 +429,22 @@ def main():
     # Создание эмбеддингов
     embeddings = clusterer.create_embeddings(processed_texts)
     
-    # Сравнение алгоритмов кластеризации
-    results, best_algo = clusterer.compare_clustering_algorithms(embeddings)
+    # Определение оптимального количества кластеров
+    optimal_k = clusterer.find_optimal_clusters_gmm(embeddings)
     
-    # Визуализация результатов
-    clusterer.visualize_results(embeddings, results, best_algo)
-    
-    # Используем лучший алгоритм для финальных результатов
-    best_labels = results[best_algo]['labels']
+    # Кластеризация GMM
+    labels, gmm, probabilities = clusterer.perform_gmm_clustering(embeddings, optimal_k)
     
     # Анализ кластеров
-    cluster_analysis = clusterer.analyze_clusters(processed_texts, original_texts, best_labels, dialog_info)
+    cluster_analysis = clusterer.analyze_clusters(processed_texts, original_texts, labels, dialog_info)
+    
+    # Визуализация
+    clusterer.visualize_clusters(embeddings, labels, cluster_analysis)
     
     # Сохранение результатов
-    final_results = clusterer.save_results(dialog_info, best_labels, cluster_analysis, OUTPUT_FILE)
+    final_results = clusterer.save_results(dialog_info, labels, cluster_analysis, OUTPUT_FILE)
     
-    print(f"\nКластеризация завершена! Результаты сохранены в {OUTPUT_FILE}")
-    print(f"Использован алгоритм: {best_algo}")
+    print(f"\nGMM кластеризация завершена! Результаты сохранены в {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
