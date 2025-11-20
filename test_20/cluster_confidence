@@ -1,4 +1,4 @@
-# clustering_first_messages_fixed_v2.py
+# clustering_first_messages_hdbscan_improved.py
 import json
 import pandas as pd
 import numpy as np
@@ -12,16 +12,58 @@ from collections import Counter
 import re
 from tqdm import tqdm
 import os
+try:
+    from hdbscan import HDBSCAN
+    HDBSCAN_AVAILABLE = True
+except ImportError:
+    HDBSCAN_AVAILABLE = False
+    print("HDBSCAN не установлен. Установите: pip install hdbscan")
 
-class FirstMessageClusteringFixedV2:
-    def __init__(self, model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'):
+class FirstMessageClusteringHDBSCAN:
+    def __init__(self, model_name='cointegrated/rubert-tiny2'):
         """Инициализация модели для создания эмбеддингов"""
         print(f"Загрузка модели {model_name}")
         self.model = SentenceTransformer(model_name)
         print("Модель загружена успешно")
     
+    def preprocess_text(self, text):
+        """Улучшенная предобработка текста"""
+        if not text or not isinstance(text, str):
+            return ""
+        
+        # Удаление всех меток
+        text = re.sub(r'\[.*?\]', '', text)
+        
+        # Удаление лишних пробелов и нормализация
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+    
+    def is_template_message(self, text):
+        """Проверка на шаблонные/системные сообщения"""
+        if not text:
+            return True
+            
+        templates = [
+            'здравствуйте', 'добрый день', 'привет', 'спасибо', 
+            'чем могу помочь', 'обратилась', 'обратился', 'доброе утро',
+            'добрый вечер', 'до свидания', 'всего доброго', 'помогите',
+            'подскажите', 'помогите пожалуйста', 'подскажите пожалуйста'
+        ]
+        text_lower = text.lower()
+        
+        # Если текст слишком короткий или состоит в основном из приветствия
+        if len(text) < 25:
+            return True
+            
+        template_count = sum(1 for template in templates if template in text_lower)
+        if template_count > 2:  # Слишком много шаблонных фраз
+            return True
+            
+        return False
+    
     def load_data(self, clustering_file, analysis_file):
-        """Загрузка данных для кластеризации по первым сообщениям"""
+        """Загрузка данных для кластеризации по первым сообщениям с улучшенной фильтрацией"""
         print("Загрузка данных...")
         
         # Загрузка данных для кластеризации
@@ -37,28 +79,40 @@ class FirstMessageClusteringFixedV2:
         
         texts = []
         dialog_info = []
+        skipped_count = 0
         
         for item in clustering_data:
             dialog_id = item.get('dialog_id')
             first_message = item.get('first_message_replaced', '')
             full_text = item.get('full_text_replaced', '')
             
-            if first_message and len(first_message.strip()) > 10:  # Минимальная длина
-                texts.append(first_message.strip())
+            # Предобработка текста
+            processed_message = self.preprocess_text(first_message)
+            
+            # Фильтрация: минимальная длина 30 символов и не шаблонное сообщение
+            if (processed_message and 
+                len(processed_message.strip()) >= 30 and 
+                not self.is_template_message(processed_message)):
+                
+                texts.append(processed_message.strip())
                 
                 # Получаем полный диалог с ролями
                 full_dialog = analysis_dict.get(dialog_id, {})
                 
                 dialog_info.append({
                     'dialog_id': dialog_id,
-                    'first_message': first_message,
+                    'first_message': processed_message,
+                    'original_first_message': first_message,  # Сохраняем оригинал для сравнения
                     'full_text': full_text,
                     'full_dialog': full_dialog,  # Полный диалог с ролями
                     'original_topic': full_dialog.get('topic', 'unknown'),
                     'source': full_dialog.get('source', 'unknown')
                 })
+            else:
+                skipped_count += 1
         
         print(f"Загружено {len(texts)} первых сообщений для кластеризации")
+        print(f"Пропущено {skipped_count} сообщений (слишком короткие или шаблонные)")
         return texts, dialog_info
     
     def create_embeddings(self, texts, batch_size=32):
@@ -75,92 +129,59 @@ class FirstMessageClusteringFixedV2:
         print(f"Создано эмбеддингов: {embeddings.shape}")
         return embeddings
     
-    def find_optimal_clusters(self, embeddings, max_k=15):
-        """Поиск оптимального количества кластеров методом локтя и силуэтного анализа"""
-        print("Поиск оптимального количества кластеров...")
+    def enhance_embeddings(self, embeddings):
+        """Улучшение эмбеддингов для лучшей кластеризации"""
+        print("Улучшение эмбеддингов...")
         
-        if len(embeddings) < 3:
-            print("Недостаточно данных для анализа кластеров")
-            return 2
+        # Нормализация эмбеддингов
+        embeddings_norm = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
         
-        wcss = []  # Within-Cluster Sum of Square
-        silhouette_scores = []
-        k_range = range(2, min(max_k + 1, len(embeddings)))
-        
-        for k in tqdm(k_range, desc="Анализ кластеров"):
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-            labels = kmeans.fit_predict(embeddings)
-            wcss.append(kmeans.inertia_)
-            
-            if len(set(labels)) > 1:
-                score = silhouette_score(embeddings, labels)
-                silhouette_scores.append(score)
-            else:
-                silhouette_scores.append(0)
-        
-        # Метод локтя: находим "локоть" на графике WCSS
-        differences = []
-        for i in range(1, len(wcss)):
-            differences.append(wcss[i-1] - wcss[i])
-        
-        # Находим точку, где разница начинает выравниваться
-        elbow_k = 2
-        if differences:
-            avg_reduction = np.mean(differences)
-            for i, diff in enumerate(differences):
-                if diff < avg_reduction * 0.5:  # Когда снижение становится меньше половины среднего
-                    elbow_k = i + 2
-                    break
-        
-        # Силуэтный анализ
-        if silhouette_scores:
-            silhouette_k = k_range[np.argmax(silhouette_scores)]
+        # Уменьшение размерности если нужно
+        if embeddings_norm.shape[1] > 50:
+            pca = PCA(n_components=min(50, embeddings_norm.shape[1]))
+            embeddings_enhanced = pca.fit_transform(embeddings_norm)
+            print(f"Уменьшена размерность с {embeddings_norm.shape[1]} до {embeddings_enhanced.shape[1]}")
         else:
-            silhouette_k = 2
-        
-        # Выбираем оптимальное k
-        optimal_k = max(elbow_k, silhouette_k)
-        
-        print(f"Оптимальное количество кластеров:")
-        print(f"  Метод локтя: {elbow_k}")
-        print(f"  Силуэтный анализ: {silhouette_k}")
-        print(f"  Выбрано: {optimal_k}")
-        
-        # Визуализация выбора k
-        self._plot_optimal_clusters(k_range, wcss, silhouette_scores, elbow_k, silhouette_k)
-        
-        return optimal_k
+            embeddings_enhanced = embeddings_norm
+            
+        return embeddings_enhanced
     
-    def _plot_optimal_clusters(self, k_range, wcss, silhouette_scores, elbow_k, silhouette_k):
-        """Визуализация выбора оптимального количества кластеров"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    def perform_hdbscan_clustering(self, embeddings):
+        """Кластеризация HDBSCAN для автоматического определения кластеров"""
+        if not HDBSCAN_AVAILABLE:
+            print("HDBSCAN не доступен, используем K-means")
+            return self.perform_kmeans_clustering(embeddings)
+            
+        print("Выполнение HDBSCAN кластеризации...")
         
-        # График метода локтя
-        ax1.plot(k_range, wcss, 'bo-')
-        ax1.axvline(x=elbow_k, color='red', linestyle='--', alpha=0.7, label=f'Локоть: k={elbow_k}')
-        ax1.set_xlabel('Количество кластеров')
-        ax1.set_ylabel('WCSS (Within-Cluster Sum of Square)')
-        ax1.set_title('Метод локтя')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
+        # Автоподбор параметров HDBSCAN на основе размера данных
+        n_samples = len(embeddings)
+        min_cluster_size = max(5, n_samples // 50)  # От 5 до 2% от данных
+        min_samples = max(3, min_cluster_size // 3)
         
-        # График силуэтного анализа
-        ax2.plot(k_range, silhouette_scores, 'go-')
-        ax2.axvline(x=silhouette_k, color='red', linestyle='--', alpha=0.7, label=f'Оптимум: k={silhouette_k}')
-        ax2.set_xlabel('Количество кластеров')
-        ax2.set_ylabel('Silhouette Score')
-        ax2.set_title('Силуэтный анализ')
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
+        clusterer = HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_epsilon=0.3,
+            metric='euclidean',
+            cluster_selection_method='leaf'
+        )
         
-        plt.tight_layout()
-        plt.savefig('clustering_optimal_k_first_messages.png', dpi=300, bbox_inches='tight')
-        plt.close()
+        labels = clusterer.fit_predict(embeddings)
         
-        print("График выбора оптимального k сохранен: clustering_optimal_k_first_messages.png")
+        # Используем встроенные вероятности HDBSCAN
+        confidence_scores = clusterer.probabilities_
+        
+        # Для точек без кластера (шум) устанавливаем низкую уверенность
+        confidence_scores[labels == -1] = 0.1
+        
+        print(f"HDBSCAN создал {len(set(labels)) - (1 if -1 in labels else 0)} кластеров")
+        print(f"Точек шума: {np.sum(labels == -1)}")
+        
+        return labels, clusterer, confidence_scores
     
-    def perform_clustering(self, embeddings, n_clusters=None):
-        """Выполнение кластеризации K-means с улучшенным расчетом уверенности"""
+    def perform_kmeans_clustering(self, embeddings, n_clusters=None):
+        """Резервный метод: K-means кластеризация"""
         if n_clusters is None:
             n_clusters = min(10, max(2, len(embeddings) // 10))
         
@@ -169,36 +190,38 @@ class FirstMessageClusteringFixedV2:
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         labels = kmeans.fit_predict(embeddings)
         
-        # УЛУЧШЕННЫЙ расчет уверенности принадлежности к кластеру
+        # Улучшенный расчет уверенности для K-means
         distances = kmeans.transform(embeddings)
+        confidence_scores = self.calculate_improved_confidence(distances, embeddings, labels)
         
-        # Метод 1: На основе расстояния до ближайшего центроида
+        return labels, kmeans, confidence_scores
+    
+    def calculate_improved_confidence(self, distances, embeddings, labels):
+        """Улучшенный расчет уверенности"""
+        # Нормализация расстояний относительно общего разброса данных
+        overall_std = np.std(embeddings, axis=0).mean()
+        
+        # Расстояние до ближайшего центроида (нормализованное)
         min_distances = np.min(distances, axis=1)
+        normalized_distances = min_distances / (overall_std + 1e-8)
         
-        # Метод 2: Отношение расстояний до ближайшего и второго ближайшего центроидов
-        sorted_distances = np.sort(distances, axis=1)
-        if sorted_distances.shape[1] > 1:
-            confidence_ratio = 1 - (sorted_distances[:, 0] / (sorted_distances[:, 1] + 1e-8))
+        # Силуэтный анализ на уровне точек
+        if len(set(labels)) > 1:
+            silhouette_vals = silhouette_samples(embeddings, labels)
+            silhouette_conf = (silhouette_vals + 1) / 2  # Преобразуем из [-1,1] в [0,1]
         else:
-            confidence_ratio = np.ones_like(min_distances)
+            silhouette_conf = np.ones(len(embeddings)) * 0.5
         
-        # Комбинируем оба метода
-        confidence_scores = 0.7 * (1 / (1 + min_distances)) + 0.3 * confidence_ratio
+        # Комбинируем метрики
+        distance_conf = 1 / (1 + normalized_distances)  # Преобразуем расстояние в уверенность
+        confidence_scores = 0.6 * distance_conf + 0.4 * silhouette_conf
         
-        # Нормализуем уверенность с использованием квантилей для лучшего распределения
+        # Нормализация с использованием квантилей
         q_low, q_high = np.quantile(confidence_scores, [0.1, 0.9])
         if q_high > q_low:
             confidence_scores = (confidence_scores - q_low) / (q_high - q_low)
-            confidence_scores = np.clip(confidence_scores, 0, 1)
         
-        # Оценка качества
-        if len(set(labels)) > 1:
-            score = silhouette_score(embeddings, labels)
-            print(f"Silhouette Score: {score:.4f}")
-        else:
-            print("Создан только один кластер")
-        
-        return labels, kmeans, confidence_scores
+        return np.clip(confidence_scores, 0, 1)
     
     def extract_keywords(self, texts, n_keywords=20):
         """Извлечение ключевых слов из текстов"""
@@ -218,7 +241,9 @@ class FirstMessageClusteringFixedV2:
             'именно', 'какоето', 'какойто', 'какаято', 'какието', 'ктото',
             'чтолибо', 'чтонибудь', 'какойнибудь', 'сразу', 'таки', 'уже',
             'часто', 'иногда', 'обычно', 'точно', 'конечно', 'вообще',
-            'возможно', 'наверное', 'probably', 'maybe', 'perhaps'
+            'возможно', 'наверное', 'probably', 'maybe', 'perhaps',
+            'здравствуйте', 'добрый', 'день', 'привет', 'спасибо', 'помощь',
+            'помогите', 'подскажите', 'пожалуйста', 'хорошо', 'понятно'
         }
         
         # Фильтрация стоп-слов и подсчет частот
@@ -233,29 +258,43 @@ class FirstMessageClusteringFixedV2:
         print("Расчет метрик качества кластеров...")
         
         cluster_metrics = {}
+        unique_labels = set(labels)
         
-        for cluster_id in set(labels):
+        # Убираем шумовый кластер (-1) из расчета метрик качества
+        if -1 in unique_labels:
+            unique_labels.remove(-1)
+        
+        for cluster_id in unique_labels:
             cluster_indices = np.where(labels == cluster_id)[0]
+            
+            if len(cluster_indices) < 2:
+                # Для кластеров с 1 точкой используем базовые метрики
+                cluster_metrics[cluster_id] = {
+                    'size': len(cluster_indices),
+                    'avg_confidence': float(confidence_scores[cluster_indices[0]]) if len(cluster_indices) > 0 else 0,
+                    'cohesion': 0,
+                    'relative_cohesion': 0,
+                    'silhouette_score': 0,
+                    'quality_score': float(confidence_scores[cluster_indices[0]]) if len(cluster_indices) > 0 else 0
+                }
+                continue
+                
             cluster_embeddings = embeddings[cluster_indices]
             
             # Средняя уверенность в кластере
             avg_confidence = np.mean(confidence_scores[cluster_indices])
             
             # Когезия кластера (среднее расстояние до центроида)
-            if len(cluster_embeddings) > 1:
-                centroid = np.mean(cluster_embeddings, axis=0)
-                distances = np.linalg.norm(cluster_embeddings - centroid, axis=1)
-                cohesion = np.mean(distances)
-                
-                # Относительная когезия (нормализованная)
-                max_possible_distance = np.max(np.linalg.norm(embeddings - np.mean(embeddings, axis=0), axis=1))
-                relative_cohesion = cohesion / max_possible_distance if max_possible_distance > 0 else 0
-            else:
-                cohesion = 0
-                relative_cohesion = 0
+            centroid = np.mean(cluster_embeddings, axis=0)
+            distances = np.linalg.norm(cluster_embeddings - centroid, axis=1)
+            cohesion = np.mean(distances)
+            
+            # Относительная когезия (нормализованная)
+            max_possible_distance = np.max(np.linalg.norm(embeddings - np.mean(embeddings, axis=0), axis=1))
+            relative_cohesion = cohesion / max_possible_distance if max_possible_distance > 0 else 0
             
             # Силуэтный score для кластера
-            if len(set(labels)) > 1:
+            if len(unique_labels) > 1:
                 cluster_silhouette = np.mean(silhouette_samples(embeddings, labels)[cluster_indices])
             else:
                 cluster_silhouette = 0
@@ -269,6 +308,18 @@ class FirstMessageClusteringFixedV2:
                 'quality_score': float(avg_confidence * (1 - relative_cohesion))  # Композитная оценка качества
             }
         
+        # Добавляем метрики для шумового кластера если есть
+        if -1 in set(labels):
+            noise_indices = np.where(labels == -1)[0]
+            cluster_metrics[-1] = {
+                'size': len(noise_indices),
+                'avg_confidence': float(np.mean(confidence_scores[noise_indices])),
+                'cohesion': 0,
+                'relative_cohesion': 0,
+                'silhouette_score': 0,
+                'quality_score': 0
+            }
+        
         return cluster_metrics
     
     def analyze_clusters(self, texts, labels, dialog_info, confidence_scores, cluster_metrics):
@@ -276,9 +327,9 @@ class FirstMessageClusteringFixedV2:
         print("Анализ кластеров...")
         
         cluster_analysis = {}
+        unique_labels = set(labels)
         
-        for cluster_id in set(labels):
-            # ИСПРАВЛЕНИЕ: преобразуем numpy.int32 в стандартный int
+        for cluster_id in unique_labels:
             cluster_id_int = int(cluster_id)
             
             cluster_indices = [i for i, label in enumerate(labels) if label == cluster_id]
@@ -286,16 +337,31 @@ class FirstMessageClusteringFixedV2:
             cluster_dialogs = [dialog_info[i] for i in cluster_indices]
             cluster_confidences = [confidence_scores[i] for i in cluster_indices]
             
+            # Для шумового кластера упрощенный анализ
+            if cluster_id == -1:
+                cluster_analysis[cluster_id_int] = {
+                    'size': len(cluster_texts),
+                    'keywords': [],
+                    'best_examples': cluster_texts[:5],  # Просто первые несколько примеров
+                    'worst_examples': [],
+                    'metka_stats': {},
+                    'topic_stats': {},
+                    'avg_message_length': float(np.mean([len(text) for text in cluster_texts])),
+                    'metrics': cluster_metrics.get(cluster_id, {}),
+                    'is_noise': True
+                }
+                continue
+            
             # Сортируем по уверенности для получения лучших примеров
             sorted_indices = np.argsort(cluster_confidences)[::-1]  # По убыванию уверенности
             best_examples = [cluster_texts[i] for i in sorted_indices[:5]]
             worst_examples = [cluster_texts[i] for i in sorted_indices[-3:]] if len(sorted_indices) > 3 else []
             
-            # Ключевые слова (увеличили количество)
+            # Ключевые слова
             keywords = self.extract_keywords(cluster_texts, n_keywords=20)
             
             # Анализ частотности меток
-            metka_stats = self._analyze_metkas(cluster_texts)
+            metka_stats = self._analyze_metkas([d['original_first_message'] for d in cluster_dialogs])
             
             # Анализ тематик исходных диалогов
             topic_stats = self._analyze_topics(cluster_dialogs)
@@ -303,12 +369,13 @@ class FirstMessageClusteringFixedV2:
             cluster_analysis[cluster_id_int] = {
                 'size': len(cluster_texts),
                 'keywords': keywords,
-                'best_examples': best_examples,  # Наиболее типичные сообщения
-                'worst_examples': worst_examples,  # Наименее типичные сообщения
+                'best_examples': best_examples,
+                'worst_examples': worst_examples,
                 'metka_stats': metka_stats,
                 'topic_stats': topic_stats,
                 'avg_message_length': float(np.mean([len(text) for text in cluster_texts])),
-                'metrics': cluster_metrics[cluster_id]
+                'metrics': cluster_metrics[cluster_id],
+                'is_noise': False
             }
         
         return cluster_analysis
@@ -327,18 +394,16 @@ class FirstMessageClusteringFixedV2:
         
         # Возвращаем только метки, которые встречаются хотя бы в 10% текстов
         threshold = len(texts) * 0.1
-        # ИСПРАВЛЕНИЕ: преобразуем значения в int
         return {k: int(v) for k, v in metka_counts.items() if v > threshold}
     
     def _analyze_topics(self, dialogs):
         """Анализ распределения исходных тематик в кластере"""
         topics = [dialog.get('original_topic', 'unknown') for dialog in dialogs]
         topic_counts = Counter(topics)
-        # ИСПРАВЛЕНИЕ: преобразуем значения в int
         return {k: int(v) for k, v in dict(topic_counts.most_common(10)).items()}
     
     def visualize_clusters(self, embeddings, labels, cluster_analysis, confidence_scores):
-        """Визуализация кластеров с помощью PCA с учетом уверенности"""
+        """Визуализация кластеров с помощью PCA"""
         print("Визуализация кластеров...")
         
         # PCA для визуализации
@@ -353,120 +418,151 @@ class FirstMessageClusteringFixedV2:
             'confidence': confidence_scores
         })
         
+        # Убираем шум из основного графика для лучшей визуализации
+        df_main = df[df['cluster'] != -1].copy() if -1 in labels else df.copy()
+        df_noise = df[df['cluster'] == -1].copy() if -1 in labels else None
+        
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 16))
         
-        # 1. Точечная диаграмма кластеров с цветом по уверенности
-        scatter = ax1.scatter(df['x'], df['y'], c=df['cluster'], cmap='tab10', 
-                            alpha=0.7, s=50)
-        ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-        ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
-        ax1.set_title('Визуализация кластеров (PCA)')
-        ax1.legend(*scatter.legend_elements(), title="Кластеры")
-        ax1.grid(True, alpha=0.3)
+        # 1. Точечная диаграмма кластеров (без шума)
+        if len(df_main) > 0:
+            scatter = ax1.scatter(df_main['x'], df_main['y'], c=df_main['cluster'], 
+                                cmap='tab10', alpha=0.7, s=50)
+            ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+            ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+            ax1.set_title('Визуализация кластеров (PCA) - без шума')
+            ax1.legend(*scatter.legend_elements(), title="Кластеры")
+            ax1.grid(True, alpha=0.3)
         
         # 2. Точечная диаграмма с прозрачностью по уверенности
-        scatter2 = ax2.scatter(df['x'], df['y'], c=df['cluster'], cmap='tab10',
-                             alpha=df['confidence'], s=50)
-        ax2.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-        ax2.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
-        ax2.set_title('Уверенность принадлежности к кластеру\n(альфа-канал = уверенность)')
-        ax2.grid(True, alpha=0.3)
+        if len(df_main) > 0:
+            scatter2 = ax2.scatter(df_main['x'], df_main['y'], c=df_main['cluster'], 
+                                 cmap='tab10', alpha=df_main['confidence'], s=50)
+            ax2.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+            ax2.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+            ax2.set_title('Уверенность принадлежности к кластеру\n(альфа-канал = уверенность)')
+            ax2.grid(True, alpha=0.3)
         
         # 3. Размеры кластеров и средняя уверенность
-        cluster_sizes = {k: v['size'] for k, v in cluster_analysis.items()}
-        cluster_confidences = {k: v['metrics']['avg_confidence'] for k, v in cluster_analysis.items()}
+        cluster_sizes = {k: v['size'] for k, v in cluster_analysis.items() if not v.get('is_noise', False)}
+        cluster_confidences = {k: v['metrics']['avg_confidence'] for k, v in cluster_analysis.items() 
+                             if not v.get('is_noise', False)}
         
-        clusters = list(cluster_sizes.keys())
-        sizes = list(cluster_sizes.values())
-        confidences = [cluster_confidences[k] for k in clusters]
-        
-        bars = ax3.bar(clusters, sizes, color=plt.cm.tab10(range(len(clusters))), alpha=0.7)
-        ax3.set_xlabel('Номер кластера')
-        ax3.set_ylabel('Количество диалогов', color='blue')
-        ax3.tick_params(axis='y', labelcolor='blue')
-        ax3.set_title('Распределение диалогов по кластерам')
-        
-        # Добавляем линию уверенности
-        ax3_conf = ax3.twinx()
-        ax3_conf.plot(clusters, confidences, 'ro-', linewidth=2, markersize=8, label='Средняя уверенность')
-        ax3_conf.set_ylabel('Средняя уверенность', color='red')
-        ax3_conf.tick_params(axis='y', labelcolor='red')
-        ax3_conf.set_ylim(0, 1)
-        ax3_conf.legend(loc='upper right')
+        if cluster_sizes:
+            clusters = list(cluster_sizes.keys())
+            sizes = list(cluster_sizes.values())
+            confidences = [cluster_confidences[k] for k in clusters]
+            
+            bars = ax3.bar(clusters, sizes, color=plt.cm.tab10(range(len(clusters))), alpha=0.7)
+            ax3.set_xlabel('Номер кластера')
+            ax3.set_ylabel('Количество диалогов', color='blue')
+            ax3.tick_params(axis='y', labelcolor='blue')
+            ax3.set_title('Распределение диалогов по кластерам')
+            
+            # Добавляем линию уверенности
+            ax3_conf = ax3.twinx()
+            ax3_conf.plot(clusters, confidences, 'ro-', linewidth=2, markersize=8, label='Средняя уверенность')
+            ax3_conf.set_ylabel('Средняя уверенность', color='red')
+            ax3_conf.tick_params(axis='y', labelcolor='red')
+            ax3_conf.set_ylim(0, 1)
+            ax3_conf.legend(loc='upper right')
         
         # 4. Качество кластеров
-        quality_scores = [cluster_analysis[k]['metrics']['quality_score'] for k in clusters]
-        cohesion_scores = [cluster_analysis[k]['metrics']['relative_cohesion'] for k in clusters]
-        
-        x_pos = np.arange(len(clusters))
-        width = 0.35
-        
-        ax4.bar(x_pos - width/2, quality_scores, width, label='Оценка качества', alpha=0.7)
-        ax4.bar(x_pos + width/2, cohesion_scores, width, label='Относительная когезия', alpha=0.7)
-        ax4.set_xlabel('Номер кластера')
-        ax4.set_ylabel('Оценка')
-        ax4.set_title('Качество кластеров')
-        ax4.set_xticks(x_pos)
-        ax4.set_xticklabels(clusters)
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
+        quality_clusters = {k: v for k, v in cluster_analysis.items() if not v.get('is_noise', False)}
+        if quality_clusters:
+            clusters = list(quality_clusters.keys())
+            quality_scores = [quality_clusters[k]['metrics']['quality_score'] for k in clusters]
+            cohesion_scores = [quality_clusters[k]['metrics']['relative_cohesion'] for k in clusters]
+            
+            x_pos = np.arange(len(clusters))
+            width = 0.35
+            
+            ax4.bar(x_pos - width/2, quality_scores, width, label='Оценка качества', alpha=0.7)
+            ax4.bar(x_pos + width/2, cohesion_scores, width, label='Относительная когезия', alpha=0.7)
+            ax4.set_xlabel('Номер кластера')
+            ax4.set_ylabel('Оценка')
+            ax4.set_title('Качество кластеров')
+            ax4.set_xticks(x_pos)
+            ax4.set_xticklabels(clusters)
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('clustering_visualization_first_messages_enhanced.png', dpi=300, bbox_inches='tight')
+        plt.savefig('clustering_visualization_hdbscan_improved.png', dpi=300, bbox_inches='tight')
         plt.close()
         
-        print("Графики кластеризации сохранены: clustering_visualization_first_messages_enhanced.png")
-        
-        # Выводим информацию о PCA
+        print("Графики кластеризации сохранены: clustering_visualization_hdbscan_improved.png")
         print(f"PCA объясненная дисперсия: PC1={pca.explained_variance_ratio_[0]:.2%}, PC2={pca.explained_variance_ratio_[1]:.2%}")
+        
+        # Отдельный график для шума если есть
+        if df_noise is not None and len(df_noise) > 0:
+            plt.figure(figsize=(10, 8))
+            plt.scatter(df_main['x'], df_main['y'], c=df_main['cluster'], cmap='tab10', alpha=0.6, s=40, label='Кластеры')
+            plt.scatter(df_noise['x'], df_noise['y'], c='gray', alpha=0.3, s=20, label='Шум')
+            plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+            plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+            plt.title('Распределение кластеров и шума')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.savefig('clustering_noise_visualization.png', dpi=300, bbox_inches='tight')
+            plt.close()
+            print("График шума сохранен: clustering_noise_visualization.png")
     
     def save_results(self, dialog_info, labels, confidence_scores, cluster_analysis, output_file, confidence_threshold=0.5):
-        """Сохранение результатов кластеризации с дополнительной информацией"""
+        """Сохранение результатов кластеризации"""
         print("Сохранение результатов...")
         
         results = []
         for i, (item, label, confidence) in enumerate(zip(dialog_info, labels, confidence_scores)):
-            # ИСПРАВЛЕНИЕ: преобразуем numpy.int32 в стандартный int
             label_int = int(label)
-            cluster_data = cluster_analysis[label_int]
+            cluster_data = cluster_analysis.get(label_int, {})
             
-            # ИСПРАВЛЕНИЕ: преобразуем bool в int для сериализации JSON
-            is_typical_example = confidence > confidence_threshold
+            is_typical_example = confidence > confidence_threshold and label_int != -1
             
-            results.append({
+            result_item = {
                 'dialog_id': item['dialog_id'],
                 'cluster_id': label_int,
-                'cluster_size': cluster_data['size'],
+                'cluster_size': cluster_data.get('size', 0),
                 'confidence_score': float(confidence),
                 'confidence_level': self._get_confidence_level(confidence),
-                'first_message_replaced': item['first_message'],
+                'first_message_processed': item['first_message'],
+                'first_message_original': item['original_first_message'],
+                'is_noise': label_int == -1,
                 'full_dialog': item['full_dialog'],
-                'keywords': [word for word, count in cluster_data['keywords'][:8]],
-                'cluster_quality': {
-                    'quality_score': float(cluster_data['metrics']['quality_score']),
-                    'avg_confidence': float(cluster_data['metrics']['avg_confidence']),
-                    'cohesion': float(cluster_data['metrics']['cohesion']),
-                    'silhouette_score': float(cluster_data['metrics']['silhouette_score'])
-                },
                 'original_topic': item.get('original_topic', 'unknown'),
                 'source': item.get('source', 'unknown'),
-                'is_typical_example': int(is_typical_example),  # Преобразуем bool в int
-                'cluster_representativeness': float(self._calculate_representativeness(confidence, cluster_data))
-            })
+                'is_typical_example': int(is_typical_example),
+            }
+            
+            # Добавляем информацию о кластере только для не-шумовых точек
+            if label_int != -1 and cluster_data:
+                result_item.update({
+                    'keywords': [word for word, count in cluster_data.get('keywords', [])[:8]],
+                    'cluster_quality': {
+                        'quality_score': float(cluster_data['metrics']['quality_score']),
+                        'avg_confidence': float(cluster_data['metrics']['avg_confidence']),
+                        'cohesion': float(cluster_data['metrics']['cohesion']),
+                        'silhouette_score': float(cluster_data['metrics']['silhouette_score'])
+                    },
+                    'cluster_representativeness': float(self._calculate_representativeness(confidence, cluster_data))
+                })
+            
+            results.append(result_item)
         
         # Сохраняем полные результаты
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
         
-        # Сохраняем отфильтрованные результаты (только высокоуверенные)
-        high_confidence_results = [r for r in results if r['confidence_score'] >= confidence_threshold]
+        # Сохраняем отфильтрованные результаты (только высокоуверенные и не шум)
+        high_confidence_results = [r for r in results 
+                                 if r['confidence_score'] >= confidence_threshold and not r['is_noise']]
         high_confidence_file = output_file.replace('.json', '_high_confidence.json')
         
         with open(high_confidence_file, 'w', encoding='utf-8') as f:
             json.dump(high_confidence_results, f, ensure_ascii=False, indent=2)
         
         # Сохраняем сводный отчет по кластерам
-        self._save_cluster_summary(cluster_analysis, 'cluster_summary_first_messages.json')
+        self._save_cluster_summary(cluster_analysis, 'cluster_summary_hdbscan_improved.json')
         
         self._print_statistics(results, cluster_analysis, confidence_threshold, len(high_confidence_results))
         
@@ -495,22 +591,28 @@ class FirstMessageClusteringFixedV2:
         summary = {}
         
         for cluster_id, analysis in cluster_analysis.items():
-            # ИСПРАВЛЕНИЕ: убеждаемся, что все значения сериализуемы
-            summary[int(cluster_id)] = {  # Преобразуем ключ в int
+            cluster_summary = {
                 'size': analysis['size'],
-                'quality_metrics': {
-                    'quality_score': float(analysis['metrics']['quality_score']),
-                    'avg_confidence': float(analysis['metrics']['avg_confidence']),
-                    'cohesion': float(analysis['metrics']['cohesion']),
-                    'silhouette_score': float(analysis['metrics']['silhouette_score'])
-                },
-                'top_keywords': [word for word, count in analysis['keywords'][:15]],
-                'common_metkas': analysis['metka_stats'],
-                'topic_distribution': analysis['topic_stats'],
-                'best_examples': analysis['best_examples'],
-                'worst_examples': analysis['worst_examples'],
-                'cluster_characteristics': self._describe_cluster_characteristics(analysis)
+                'is_noise': analysis.get('is_noise', False)
             }
+            
+            if not analysis.get('is_noise', False):
+                cluster_summary.update({
+                    'quality_metrics': {
+                        'quality_score': float(analysis['metrics']['quality_score']),
+                        'avg_confidence': float(analysis['metrics']['avg_confidence']),
+                        'cohesion': float(analysis['metrics']['cohesion']),
+                        'silhouette_score': float(analysis['metrics']['silhouette_score'])
+                    },
+                    'top_keywords': [word for word, count in analysis['keywords'][:15]],
+                    'common_metkas': analysis['metka_stats'],
+                    'topic_distribution': analysis['topic_stats'],
+                    'best_examples': analysis['best_examples'],
+                    'worst_examples': analysis['worst_examples'],
+                    'cluster_characteristics': self._describe_cluster_characteristics(analysis)
+                })
+            
+            summary[int(cluster_id)] = cluster_summary
         
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -520,6 +622,9 @@ class FirstMessageClusteringFixedV2:
     def _describe_cluster_characteristics(self, analysis):
         """Описание характеристик кластера"""
         characteristics = []
+        
+        if analysis.get('is_noise', False):
+            return ["Шумовой кластер - точки не принадлежат ни одному кластеру"]
         
         # На основе ключевых слов
         top_keywords = [word for word, count in analysis['keywords'][:5]]
@@ -538,7 +643,7 @@ class FirstMessageClusteringFixedV2:
         elif metrics['quality_score'] > 0.5:
             characteristics.append("Среднекачественный кластер")
         else:
-            characteristics.append("Низкокачественный кластер (размытые границы)")
+            characteristics.append("Низкокачественный кластер")
         
         # На основе размера
         if analysis['size'] > 50:
@@ -551,10 +656,18 @@ class FirstMessageClusteringFixedV2:
     def _print_statistics(self, results, cluster_analysis, confidence_threshold, high_confidence_count):
         """Вывод статистики кластеризации"""
         print("\n" + "="*80)
-        print("РАСШИРЕННАЯ СТАТИСТИКА КЛАСТЕРИЗАЦИИ ПО ПЕРВЫМ СООБЩЕНИЯМ")
+        print("СТАТИСТИКА КЛАСТЕРИЗАЦИИ HDBSCAN (УЛУЧШЕННАЯ)")
         print("="*80)
         print(f"Всего диалогов: {len(results)}")
-        print(f"Количество кластеров: {len(cluster_analysis)}")
+        
+        # Статистика по кластерам и шуму
+        noise_count = sum(1 for r in results if r['is_noise'])
+        cluster_count = len(results) - noise_count
+        num_clusters = len([k for k, v in cluster_analysis.items() if not v.get('is_noise', False)])
+        
+        print(f"Количество кластеров: {num_clusters}")
+        print(f"Точек в кластерах: {cluster_count} ({cluster_count/len(results)*100:.1f}%)")
+        print(f"Точек шума: {noise_count} ({noise_count/len(results)*100:.1f}%)")
         print(f"Диалогов с высокой уверенностью (порог {confidence_threshold}): {high_confidence_count} ({high_confidence_count/len(results)*100:.1f}%)")
         
         # Распределение по уровням уверенности
@@ -567,11 +680,16 @@ class FirstMessageClusteringFixedV2:
         
         print("\nДетальный анализ кластеров:")
         for cluster_id, analysis in sorted(cluster_analysis.items()):
+            if analysis.get('is_noise', False):
+                print(f"\n  Шумовой кластер (-1):")
+                print(f"    Размер: {analysis['size']} диалогов")
+                continue
+                
             metrics = analysis['metrics']
             print(f"\n  Кластер {cluster_id}:")
             print(f"    Размер: {analysis['size']} диалогов")
             print(f"    Качество: {metrics['quality_score']:.3f} (уверенность: {metrics['avg_confidence']:.3f}, когезия: {metrics['relative_cohesion']:.3f})")
-            print(f"    Топ-8 ключевых слов: {[word for word, count in analysis['keywords'][:8]]}")
+            print(f"    Топ-5 ключевых слов: {[word for word, count in analysis['keywords'][:5]]}")
             
             if analysis['metka_stats']:
                 print(f"    Частые метки: {analysis['metka_stats']}")
@@ -581,49 +699,41 @@ class FirstMessageClusteringFixedV2:
                 print(f"    Основные темы: {top_topics}")
 
 def main():
-    """Основная функция расширенной кластеризации по первым сообщениям"""
+    """Основная функция улучшенной кластеризации по первым сообщениям с HDBSCAN"""
     
     # Конфигурация
     CLUSTERING_FILE = "clustering_data.json"
     ANALYSIS_FILE = "analysis_data_replaced.json"
-    OUTPUT_FILE = "clustering_results_first_messages_fixed.json"
-    CONFIDENCE_THRESHOLD = 0.3  # Можно настроить порог уверенности
-    NUM_CLUSTERS = None  # Автоопределение
-    
-    print("=" * 80)
-    print("УЛУЧШЕННАЯ КЛАСТЕРИЗАЦИЯ ПО ПЕРВЫМ СООБЩЕНИЯМ (ИСПРАВЛЕННАЯ V2)")
-    print("=" * 80)
+    OUTPUT_FILE = "clustering_results_hdbscan_improved.json"
+    CONFIDENCE_THRESHOLD = 0.3
     
     # Инициализация улучшенного кластеризатора
-    clusterer = FirstMessageClusteringFixedV2()
+    clusterer = FirstMessageClusteringHDBSCAN()
     
-    # Загрузка данных
+    # Загрузка данных с улучшенной фильтрацией
     texts, dialog_info = clusterer.load_data(CLUSTERING_FILE, ANALYSIS_FILE)
     
     if len(texts) < 3:
         print("Недостаточно данных для кластеризации (нужно минимум 3 текста)")
         return
     
-    # Создание эмбеддингов
+    # Создание и улучшение эмбеддингов
     embeddings = clusterer.create_embeddings(texts)
+    embeddings_enhanced = clusterer.enhance_embeddings(embeddings)
     
-    # Определение количества кластеров
-    if NUM_CLUSTERS is None:
-        NUM_CLUSTERS = clusterer.find_optimal_clusters(embeddings)
-    
-    # Кластеризация с улучшенным расчетом уверенности
-    labels, kmeans, confidence_scores = clusterer.perform_clustering(embeddings, NUM_CLUSTERS)
+    # Кластеризация HDBSCAN
+    labels, clusterer_model, confidence_scores = clusterer.perform_hdbscan_clustering(embeddings_enhanced)
     
     # Расчет метрик качества кластеров
-    cluster_metrics = clusterer.calculate_cluster_quality_metrics(embeddings, labels, confidence_scores)
+    cluster_metrics = clusterer.calculate_cluster_quality_metrics(embeddings_enhanced, labels, confidence_scores)
     
     # Анализ кластеров
     cluster_analysis = clusterer.analyze_clusters(texts, labels, dialog_info, confidence_scores, cluster_metrics)
     
     # Визуализация
-    clusterer.visualize_clusters(embeddings, labels, cluster_analysis, confidence_scores)
+    clusterer.visualize_clusters(embeddings_enhanced, labels, cluster_analysis, confidence_scores)
     
-    # Сохранение результатов (два файла: полный и с высокой уверенностью)
+    # Сохранение результатов
     results, high_confidence_results = clusterer.save_results(
         dialog_info, labels, confidence_scores, cluster_analysis, 
         OUTPUT_FILE, CONFIDENCE_THRESHOLD
@@ -632,7 +742,7 @@ def main():
     print(f"\nКластеризация завершена!")
     print(f"Полные результаты сохранены в {OUTPUT_FILE}")
     print(f"Результаты с высокой уверенностью (порог {CONFIDENCE_THRESHOLD}) сохранены в {OUTPUT_FILE.replace('.json', '_high_confidence.json')}")
-    print(f"Сводный отчет по кластерам: cluster_summary_first_messages.json")
+    print(f"Сводный отчет по кластерам: cluster_summary_hdbscan_improved.json")
     
     # Анализ распределения уверенности
     print(f"\nАнализ уверенности:")
