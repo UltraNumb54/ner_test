@@ -1,68 +1,724 @@
-    def perform_hdbscan_clustering(self, embeddings):
+# clustering_first_messages_hdbscan_improved.py
+import json
+import pandas as pd
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.metrics import silhouette_score, silhouette_samples, calinski_harabasz_score, davies_bouldin_score
+from sklearn.decomposition import PCA
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import Counter
+import re
+from tqdm import tqdm
+import os
+import string
+try:
+    from hdbscan import HDBSCAN
+    HDBSCAN_AVAILABLE = True
+except ImportError:
+    HDBSCAN_AVAILABLE = False
+    print("HDBSCAN не установлен. Установите: pip install hdbscan")
+
+try:
+    import umap.umap_ as umap
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
+    print("UMAP не установлен. Установите: pip install umap-learn")
+
+class FirstMessageClusteringHDBSCAN:
+    def __init__(self, model_name='cointegrated/rubert-tiny2', use_umap=True):
+        """Инициализация модели для создания эмбеддингов"""
+        print(f"Загрузка модели {model_name}")
+        self.model = SentenceTransformer(model_name)
+        self.use_umap = use_umap and UMAP_AVAILABLE
+        self.stop_words = self._load_stop_words()
+        print("Модель загружена успешно")
+
+    def _load_stop_words(self):
+        """Загрузка расширенного списка стоп-слов"""
+        basic_stop_words = {
+            'этот', 'такой', 'какой', 'который', 'очень', 'много', 'можно',
+            'нужно', 'должен', 'хочу', 'хотеть', 'хотят', 'свой', 'мочь',
+            'будет', 'есть', 'быть', 'сказать', 'говорить', 'пожалуйста',
+            'здравствуйте', 'спасибо', 'проблема', 'вопрос', 'помощь',
+            'интересует', 'узнать', 'поэтому', 'когда', 'потом', 'сейчас',
+            'только', 'хотя', 'вообще', 'вполне', 'вроде', 'далее', 'ещё',
+            'именно', 'какоето', 'какойто', 'какаято', 'какието', 'ктото',
+            'чтолибо', 'чтонибудь', 'какойнибудь', 'сразу', 'таки', 'уже',
+            'часто', 'иногда', 'обычно', 'точно', 'конечно', 'вообще',
+            'возможно', 'наверное', 'probably', 'maybe', 'perhaps',
+            'здравствуйте', 'добрый', 'день', 'привет', 'спасибо', 'помощь',
+            'помогите', 'подскажите', 'пожалуйста', 'хорошо', 'понятно',
+            'вообщем', 'значит', 'например', 'короче', 'слушай', 'смотри',
+            'понимаешь', 'видишь', 'вполне', 'вродебы', 'кажется', 'наверно',
+            'прямо', 'совсем', 'точно', 'типа', 'какбы', 'врядли', 'неужто',
+            'давай', 'ладно', 'окей', 'хм', 'э', 'ну', 'ага', 'угу'
+        }
+        return basic_stop_words
+
+    def advanced_preprocess_text(self, text):
+        """Улучшенная предобработка текста с удалением стоп-слов и пунктуации"""
+        if not text or not isinstance(text, str):
+            return ""
+
+        # Приведение к нижнему регистру
+        text = text.lower()
+
+        # Удаление всех меток
+        text = re.sub(r'\[.*?\]', '', text)
+
+        # Удаление пунктуации
+        text = text.translate(str.maketrans('', '', string.punctuation))
+
+        # Удаление лишних пробелов и нормализация
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        # Удаление стоп-слов
+        words = text.split()
+        filtered_words = [word for word in words if word not in self.stop_words and len(word) > 2]
+        
+        return ' '.join(filtered_words)
+
+    def preprocess_text(self, text):
+        """Основная предобработка текста (сохраняет для обратной совместимости)"""
+        return self.advanced_preprocess_text(text)
+
+    def is_template_message(self, text):
+        """Улучшенная проверка на шаблонные/системные сообщения"""
+        if not text:
+            return True
+
+        templates = [
+            'здравствуйте', 'добрый день', 'привет', 'спасибо',
+            'чем могу помочь', 'обратилась', 'обратился', 'доброе утро',
+            'добрый вечер', 'до свидания', 'всего доброго', 'помогите',
+            'подскажите', 'помогите пожалуйста', 'подскажите пожалуйста',
+            'доброй ночи', 'приветствую', 'здраствуйте', 'добрый день подскажите',
+            'здравствуйте подскажите', 'добрый день помогите', 'здравствуйте помогите'
+        ]
+        
+        text_lower = text.lower()
+
+        # Если текст слишком короткий
+        if len(text) < 30:
+            return True
+
+        # Проверка на наличие слишком много шаблонных фраз
+        template_count = sum(1 for template in templates if template in text_lower)
+        if template_count > 1:  # Уменьшили порог
+            return True
+
+        # Проверка на сообщения, которые слишком общие
+        generic_patterns = [
+            r'^здравствуйте.*пожалуйста$',
+            r'^добрый день.*пожалуйста$',
+            r'^подскажите.*пожалуйста$',
+            r'^помогите.*пожалуйста$'
+        ]
+        
+        for pattern in generic_patterns:
+            if re.match(pattern, text_lower):
+                return True
+
+        return False
+
+    def load_data(self, clustering_file, analysis_file):
+        """Загрузка данных для кластеризации по первым сообщениям с улучшенной фильтрацией"""
+        print("Загрузка данных...")
+
+        # Загрузка данных для кластеризации
+        with open(clustering_file, 'r', encoding='utf-8') as f:
+            clustering_data = json.load(f)
+
+        # Загрузка полных диалогов для анализа
+        with open(analysis_file, 'r', encoding='utf-8') as f:
+            analysis_data = json.load(f)
+
+        # Создаем словарь для быстрого доступа к полным диалогам
+        analysis_dict = {item['dialog_id']: item for item in analysis_data}
+
+        texts = []
+        dialog_info = []
+        skipped_count = 0
+        template_count = 0
+
+        for item in clustering_data:
+            dialog_id = item.get('dialog_id')
+            first_message = item.get('first_message_replaced', '')
+            full_text = item.get('full_text_replaced', '')
+
+            # Предобработка текста
+            processed_message = self.advanced_preprocess_text(first_message)
+
+            # Фильтрация
+            if (processed_message and len(processed_message.strip()) >= 25):
+                if self.is_template_message(processed_message):
+                    template_count += 1
+                    skipped_count += 1
+                    continue
+                    
+                texts.append(processed_message.strip())
+
+                # Получаем полный диалог с ролями
+                full_dialog = analysis_dict.get(dialog_id, {})
+
+                dialog_info.append({
+                    'dialog_id': dialog_id,
+                    'first_message': processed_message,
+                    'original_first_message': first_message,
+                    'full_text': full_text,
+                    'full_dialog': full_dialog,
+                    'original_topic': full_dialog.get('topic', 'unknown'),
+                    'source': full_dialog.get('source', 'unknown')
+                })
+            else:
+                skipped_count += 1
+
+        print(f"Загружено {len(texts)} первых сообщений для кластеризации")
+        print(f"Пропущено {skipped_count} сообщений (из них {template_count} шаблонных)")
+        return texts, dialog_info
+
+    def create_embeddings(self, texts, batch_size=32):
+        """Создание векторных представлений текстов"""
+        print("Создание эмбеддингов...")
+
+        embeddings = self.model.encode(
+            texts,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True  # Нормализация для лучшей кластеризации
+        )
+
+        print(f"Создано эмбеддингов: {embeddings.shape}")
+        return embeddings
+
+    def reduce_dimensionality(self, embeddings, n_components=50, umap_neighbors=15, umap_min_dist=0.1):
+        """Уменьшение размерности с использованием PCA или UMAP"""
+        print(f"Уменьшение размерности с {embeddings.shape[1]} до {n_components} компонент...")
+        
+        if self.use_umap and UMAP_AVAILABLE:
+            print(f"Использование UMAP для уменьшения размерности (n_neighbors={umap_neighbors}, min_dist={umap_min_dist})...")
+            reducer = umap.UMAP(
+                n_components=min(n_components, embeddings.shape[1] - 1),
+                n_neighbors=umap_neighbors,
+                min_dist=umap_min_dist,
+                metric='cosine',
+                random_state=42
+            )
+            embeddings_reduced = reducer.fit_transform(embeddings)
+            print(f"UMAP уменьшил размерность до {embeddings_reduced.shape[1]}")
+        else:
+            print("Использование PCA для уменьшения размерности...")
+            pca = PCA(n_components=min(n_components, embeddings.shape[1]), random_state=42)
+            embeddings_reduced = pca.fit_transform(embeddings)
+            explained_variance = sum(pca.explained_variance_ratio_)
+            print(f"PCA уменьшил размерность до {embeddings_reduced.shape[1]}, объясненная дисперсия: {explained_variance:.3f}")
+
+        # Стандартизация после уменьшения размерности
+        scaler = StandardScaler()
+        embeddings_standardized = scaler.fit_transform(embeddings_reduced)
+        
+        return embeddings_standardized
+
+    def enhance_embeddings(self, embeddings, umap_neighbors=15, umap_min_dist=0.1):
+        """Улучшение эмбеддингов для лучшей кластеризации"""
+        print("Улучшение эмбеддингов...")
+
+        # Определение оптимального количества компонент
+        n_samples = len(embeddings)
+        n_components = min(50, n_samples - 1, embeddings.shape[1])
+        n_components = max(5, n_components)  # Минимум 5 компонент
+
+        # Уменьшение размерности
+        embeddings_enhanced = self.reduce_dimensionality(
+            embeddings, n_components, umap_neighbors, umap_min_dist
+        )
+
+        return embeddings_enhanced
+
+    def find_optimal_hdbscan_params(self, embeddings, target_clusters_range=(5, 15)):
+        """Поиск оптимальных параметров HDBSCAN для получения большего числа кластеров"""
+        print("Поиск оптимальных параметров HDBSCAN для увеличения числа кластеров...")
+        
+        n_samples = len(embeddings)
+        
+        # Параметры для тестирования
+        param_combinations = []
+        
+        # Разные комбинации параметров для получения большего числа кластеров
+        base_min_cluster_size = max(3, n_samples // 100)  # Более мелкие кластеры
+        base_min_samples = max(1, base_min_cluster_size // 3)
+        
+        for min_cluster_size in [base_min_cluster_size, base_min_cluster_size // 2, max(2, base_min_cluster_size // 3)]:
+            for min_samples in [base_min_samples, max(1, base_min_samples // 2), 1]:
+                for cluster_selection_epsilon in [0.1, 0.2, 0.3]:
+                    param_combinations.append({
+                        'min_cluster_size': min_cluster_size,
+                        'min_samples': min_samples,
+                        'cluster_selection_epsilon': cluster_selection_epsilon,
+                        'metric': 'euclidean',
+                        'cluster_selection_method': 'eom'  # Пробуем также 'leaf'
+                    })
+        
+        best_params = None
+        best_score = -1
+        best_n_clusters = 0
+        
+        # Ограничим количество тестов для скорости
+        max_tests = min(10, len(param_combinations))
+        test_params = param_combinations[:max_tests]
+        
+        for i, params in enumerate(test_params):
+            try:
+                clusterer = HDBSCAN(**params)
+                labels = clusterer.fit_predict(embeddings)
+                
+                n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+                noise_ratio = np.sum(labels == -1) / len(labels)
+                
+                # Оцениваем качество только если есть кластеры и не слишком много шума
+                if n_clusters >= 2 and noise_ratio < 0.7:
+                    quality_score = self.evaluate_clustering_quality(embeddings, labels)
+                    
+                    # Бонус за количество кластеров в целевом диапазоне
+                    cluster_bonus = 0
+                    if target_clusters_range[0] <= n_clusters <= target_clusters_range[1]:
+                        cluster_bonus = 0.2
+                    elif n_clusters > target_clusters_range[1]:
+                        cluster_bonus = 0.1
+                    
+                    total_score = quality_score + cluster_bonus - (noise_ratio * 0.1)
+                    
+                    if total_score > best_score:
+                        best_score = total_score
+                        best_params = params
+                        best_n_clusters = n_clusters
+                        
+                print(f"  Тест {i+1}: {n_clusters} кластеров, шум: {noise_ratio:.2f}, качество: {quality_score:.3f}")
+                
+            except Exception as e:
+                continue
+        
+        if best_params:
+            print(f"Найденные оптимальные параметры: {best_params}")
+            print(f"Ожидаемое количество кластеров: {best_n_clusters}")
+            return best_params
+        else:
+            # Возвращаем параметры по умолчанию
+            return self.optimize_hdbscan_parameters(embeddings)
+
+    def optimize_hdbscan_parameters(self, embeddings):
+        """Автоподбор параметров для HDBSCAN"""
+        n_samples = len(embeddings)
+        
+        # Более агрессивные параметры для большего числа кластеров
+        if n_samples < 100:
+            min_cluster_size = max(2, n_samples // 20)  # Уменьшили для большего числа кластеров
+            min_samples = 1
+            cluster_selection_epsilon = 0.1
+        elif n_samples < 1000:
+            min_cluster_size = max(3, n_samples // 50)  # Уменьшили для большего числа кластеров
+            min_samples = 1
+            cluster_selection_epsilon = 0.15
+        else:
+            min_cluster_size = max(5, n_samples // 100)  # Уменьшили для большего числа кластеров
+            min_samples = 2
+            cluster_selection_epsilon = 0.2
+
+        return {
+            'min_cluster_size': min_cluster_size,
+            'min_samples': min_samples,
+            'cluster_selection_epsilon': cluster_selection_epsilon,
+            'metric': 'euclidean',
+            'cluster_selection_method': 'eom'
+        }
+
+    def perform_advanced_hdbscan_clustering(self, embeddings, target_clusters_range=(5, 15)):
+        """Продвинутая кластеризация HDBSCAN с поиском оптимальных параметров"""
         if not HDBSCAN_AVAILABLE:
             print("HDBSCAN не доступен, используем K-means")
             return self.perform_kmeans_clustering(embeddings)
 
-        print("Выполнение улучшенной HDBSCAN кластеризации...")
+        print("Выполнение продвинутой HDBSCAN кластеризации...")
 
-        min_clusters_desired = 3  # Желаемое минимальное количество кластеров
-        best_labels = None
-        best_confidence = None
-        best_clusterer = None
-        best_quality = -1
+        # Поиск оптимальных параметров
+        params = self.find_optimal_hdbscan_params(embeddings, target_clusters_range)
+        
+        print(f"Используемые параметры HDBSCAN: {params}")
 
-        # Параметры для попыток: (min_cluster_size, min_samples, cluster_selection_method)
-        attempts_params = [
-            self.optimize_hdbscan_parameters(embeddings),  # Первая попытка с обычными параметрами
-            {
-                'min_cluster_size': 3,
-                'min_samples': 1,
-                'cluster_selection_epsilon': 0.3,
-                'metric': 'euclidean',
-                'cluster_selection_method': 'leaf'
-            },
-            {
-                'min_cluster_size': 2,
-                'min_samples': 1,
-                'cluster_selection_epsilon': 0.2,
-                'metric': 'euclidean',
-                'cluster_selection_method': 'leaf'
-            }
+        clusterer = HDBSCAN(**params)
+        labels = clusterer.fit_predict(embeddings)
+
+        # Используем встроенные вероятности HDBSCAN
+        confidence_scores = clusterer.probabilities_
+
+        # Для точек без кластера (шум) устанавливаем низкую уверенность
+        confidence_scores[labels == -1] = 0.1
+
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        noise_points = np.sum(labels == -1)
+        
+        print(f"HDBSCAN создал {n_clusters} кластеров")
+        print(f"Точек шума: {noise_points} ({noise_points/len(labels)*100:.1f}%)")
+
+        # Если кластеров все еще мало, пробуем дополнительные методы
+        if n_clusters < target_clusters_range[0]:
+            print(f"Слишком мало кластеров ({n_clusters}), пробуем альтернативные методы...")
+            return self.try_alternative_clustering(embeddings, labels, n_clusters, target_clusters_range)
+
+        return labels, clusterer, confidence_scores
+
+    def try_alternative_clustering(self, embeddings, initial_labels, initial_n_clusters, target_clusters_range):
+        """Альтернативные методы кластеризации когда HDBSCAN дает мало кластеров"""
+        print("Пробуем альтернативные методы кластеризации...")
+        
+        # Метод 1: DBSCAN с оптимизированными параметрами
+        print("Метод 1: DBSCAN с автоматическим подбором параметров...")
+        dbscan_labels, dbscan_confidence = self.perform_dbscan_clustering(embeddings)
+        dbscan_n_clusters = len(set(dbscan_labels)) - (1 if -1 in dbscan_labels else 0)
+        
+        # Метод 2: K-means с оптимальным количеством кластеров
+        print("Метод 2: K-means с оптимальным количеством кластеров...")
+        kmeans_labels, kmeans_model, kmeans_confidence = self.perform_kmeans_clustering(
+            embeddings, n_clusters=min(target_clusters_range[1], len(embeddings) // 3)
+        )
+        kmeans_n_clusters = len(set(kmeans_labels))
+        
+        # Метод 3: Иерархическая кластеризация через HDBSCAN с другими параметрами
+        print("Метод 3: HDBSCAN с агрессивными параметрами...")
+        aggressive_params = {
+            'min_cluster_size': 2,
+            'min_samples': 1,
+            'cluster_selection_epsilon': 0.05,
+            'metric': 'euclidean',
+            'cluster_selection_method': 'leaf'
+        }
+        aggressive_clusterer = HDBSCAN(**aggressive_params)
+        aggressive_labels = aggressive_clusterer.fit_predict(embeddings)
+        aggressive_confidence = aggressive_clusterer.probabilities_
+        aggressive_confidence[aggressive_labels == -1] = 0.1
+        aggressive_n_clusters = len(set(aggressive_labels)) - (1 if -1 in aggressive_labels else 0)
+        
+        # Выбираем лучший метод
+        methods = [
+            (dbscan_labels, dbscan_confidence, dbscan_n_clusters, "DBSCAN"),
+            (kmeans_labels, kmeans_confidence, kmeans_n_clusters, "K-means"),
+            (aggressive_labels, aggressive_confidence, aggressive_n_clusters, "HDBSCAN агрессивный")
         ]
+        
+        best_method = None
+        best_score = -1
+        
+        for labels, confidence, n_clusters, method_name in methods:
+            if n_clusters >= target_clusters_range[0]:
+                quality = self.evaluate_clustering_quality(embeddings, labels)
+                noise_ratio = np.sum(labels == -1) / len(labels) if -1 in labels else 0
+                score = quality - (noise_ratio * 0.2)
+                
+                if score > best_score:
+                    best_score = score
+                    best_method = (labels, confidence, n_clusters, method_name)
+        
+        if best_method:
+            labels, confidence, n_clusters, method_name = best_method
+            print(f"Выбран метод: {method_name} с {n_clusters} кластерами (оценка: {best_score:.3f})")
+            
+            # Создаем фиктивный clusterer для совместимости
+            class DummyClusterer:
+                def __init__(self):
+                    self.probabilities_ = confidence
+                    
+            clusterer = DummyClusterer()
+            
+            return labels, clusterer, confidence
+        else:
+            # Возвращаем лучший из доступных методов
+            methods_with_scores = []
+            for labels, confidence, n_clusters, method_name in methods:
+                if n_clusters > 1:  # Хотя бы 2 кластера
+                    quality = self.evaluate_clustering_quality(embeddings, labels)
+                    methods_with_scores.append((quality, labels, confidence, n_clusters, method_name))
+            
+            if methods_with_scores:
+                methods_with_scores.sort(reverse=True)
+                best_quality, best_labels, best_confidence, best_n_clusters, best_method_name = methods_with_scores[0]
+                print(f"Лучший доступный метод: {best_method_name} с {best_n_clusters} кластерами (качество: {best_quality:.3f})")
+                
+                class DummyClusterer:
+                    def __init__(self):
+                        self.probabilities_ = best_confidence
+                        
+                clusterer = DummyClusterer()
+                return best_labels, clusterer, best_confidence
+            else:
+                # Возвращаем исходную кластеризацию
+                print("Все методы дали плохие результаты, возвращаем исходную кластеризацию")
+                clusterer = HDBSCAN(**self.optimize_hdbscan_parameters(embeddings))
+                labels = clusterer.fit_predict(embeddings)
+                confidence = clusterer.probabilities_
+                confidence[labels == -1] = 0.1
+                return labels, clusterer, confidence
 
-        for i, params in enumerate(attempts_params):
-            print(f"Попытка {i+1} с параметрами: {params}")
-            clusterer = HDBSCAN(**params)
-            labels = clusterer.fit_predict(embeddings)
+    def perform_dbscan_clustering(self, embeddings):
+        """Кластеризация DBSCAN с автоматическим подбором параметров"""
+        # Автоподбор eps с помощью метода локтя
+        neighbors = NearestNeighbors(n_neighbors=min(10, len(embeddings) - 1))
+        neighbors_fit = neighbors.fit(embeddings)
+        distances, indices = neighbors_fit.kneighbors(embeddings)
+        distances = np.sort(distances[:, -1], axis=0)
+        
+        # Находим точку изгиба
+        gradients = np.diff(distances)
+        second_gradients = np.diff(gradients)
+        elbow_point = np.argmax(second_gradients) + 2 if len(second_gradients) > 0 else 2
+        eps = distances[min(elbow_point, len(distances) - 1)]
+        
+        min_samples = max(2, len(embeddings) // 50)
+        
+        dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric='euclidean')
+        labels = dbscan.fit_predict(embeddings)
+        
+        # Расчет уверенности для DBSCAN (расстояние до ближайшего core point)
+        confidence = np.ones(len(labels)) * 0.5
+        core_indices = dbscan.core_sample_indices_
+        
+        if len(core_indices) > 0:
+            core_points = embeddings[core_indices]
+            for i, point in enumerate(embeddings):
+                if labels[i] != -1:
+                    # Расстояние до ближайшего core point того же кластера
+                    same_cluster_cores = core_points[labels[core_indices] == labels[i]]
+                    if len(same_cluster_cores) > 0:
+                        distances = np.linalg.norm(same_cluster_cores - point, axis=1)
+                        min_distance = np.min(distances)
+                        # Преобразуем расстояние в уверенность
+                        confidence[i] = max(0.1, 1 - min_distance / (eps * 2))
+        
+        confidence[labels == -1] = 0.1
+        
+        return labels, confidence
 
-            # Уверенность
-            confidence_scores = clusterer.probabilities_
-            confidence_scores[labels == -1] = 0.1
+    def perform_hdbscan_clustering(self, embeddings):
+        """Основная функция кластеризации HDBSCAN (для обратной совместимости)"""
+        return self.perform_advanced_hdbscan_clustering(embeddings, target_clusters_range=(5, 15))
 
-            # Оцениваем качество
-            n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-            quality = self.evaluate_clustering_quality(embeddings, labels)
+    def evaluate_clustering_quality(self, embeddings, labels):
+        """Оценка качества кластеризации с использованием нескольких метрик"""
+        if len(set(labels)) < 2:
+            return 0
+            
+        valid_mask = labels != -1
+        if np.sum(valid_mask) < 2:
+            return 0
+            
+        valid_embeddings = embeddings[valid_mask]
+        valid_labels = labels[valid_mask]
+        
+        if len(set(valid_labels)) < 2:
+            return 0
+            
+        try:
+            # Силуэтный коэффициент
+            silhouette_avg = silhouette_score(valid_embeddings, valid_labels)
+            
+            # Calinski-Harabasz Index (чем выше, тем лучше)
+            ch_score = calinski_harabasz_score(valid_embeddings, valid_labels)
+            
+            # Davies-Bouldin Index (чем ниже, тем лучше)
+            db_score = davies_bouldin_score(valid_embeddings, valid_labels)
+            
+            # Нормализация метрик
+            silhouette_norm = max(0, silhouette_avg)  # Силуэт в диапазоне [-1, 1]
+            ch_norm = min(1.0, ch_score / 1000) if ch_score > 0 else 0  # Нормализация CH
+            db_norm = max(0, 1 - db_score / 10) if db_score > 0 else 0  # Нормализация DB
+            
+            # Композитная оценка качества
+            composite_score = (silhouette_norm + ch_norm + db_norm) / 3
+            
+            return composite_score
+            
+        except Exception as e:
+            print(f"Ошибка при расчете метрик качества: {e}")
+            return 0
 
-            print(f"  Получено кластеров: {n_clusters}, качество: {quality:.3f}")
+    def perform_kmeans_clustering(self, embeddings, n_clusters=None):
+        """Резервный метод: K-means кластеризация"""
+        if n_clusters is None:
+            # Автоматический подбор количества кластеров
+            n_clusters = self.estimate_optimal_clusters(embeddings)
 
-            # Если это первая попытка и кластеров достаточно, то берем ее
-            if i == 0 and n_clusters >= min_clusters_desired:
-                print(f"  Первая попытка дала {n_clusters} кластеров, приемлемо.")
-                return labels, clusterer, confidence_scores
+        print(f"Выполнение K-means кластеризации с {n_clusters} кластерами...")
 
-            # Иначе, если качество лучше и кластеров хотя бы 2, то запоминаем
-            if n_clusters >= 2 and quality > best_quality:
-                best_quality = quality
-                best_labels = labels
-                best_confidence = confidence_scores
-                best_clusterer = clusterer
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(embeddings)
 
-        # Если нашли какую-то кластеризацию с хотя бы 2 кластерами, возвращаем ее
-        if best_labels is not None:
-            n_clusters = len(set(best_labels)) - (1 if -1 in best_labels else 0)
-            print(f"Выбрана кластеризация с {n_clusters} кластерами и качеством {best_quality:.3f}")
-            return best_labels, best_clusterer, best_confidence
+        # Улучшенный расчет уверенности для K-means
+        distances = kmeans.transform(embeddings)
+        confidence_scores = self.calculate_improved_confidence(distances, embeddings, labels)
 
-        # Если ничего не помогло, используем KMeans
-        print("HDBSCAN не смог найти кластеры, используем K-means")
-        return self.perform_kmeans_clustering(embeddings)
+        return labels, kmeans, confidence_scores
+
+    def estimate_optimal_clusters(self, embeddings, max_clusters=15):
+        """Оценка оптимального количества кластеров для K-means"""
+        if len(embeddings) < 10:
+            return min(3, len(embeddings))
+            
+        max_clusters = min(max_clusters, len(embeddings) - 1)
+        silhouette_scores = []
+        
+        for n_clusters in range(2, max_clusters + 1):
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=5)
+            labels = kmeans.fit_predict(embeddings)
+            
+            if len(set(labels)) < 2:
+                silhouette_scores.append(-1)
+            else:
+                score = silhouette_score(embeddings, labels)
+                silhouette_scores.append(score)
+        
+        if silhouette_scores:
+            optimal_clusters = np.argmax(silhouette_scores) + 2
+            print(f"Оптимальное количество кластеров (силуэт): {optimal_clusters}")
+            return optimal_clusters
+        else:
+            return min(5, len(embeddings))
+
+    def calculate_improved_confidence(self, distances, embeddings, labels):
+        """Улучшенный расчет уверенности с использованием нескольких метрик"""
+        # Расстояние до ближайшего центроида
+        min_distances = np.min(distances, axis=1)
+        
+        # Нормализация расстояний
+        distance_mean = np.mean(min_distances)
+        distance_std = np.std(min_distances)
+        if distance_std > 0:
+            normalized_distances = (min_distances - distance_mean) / distance_std
+        else:
+            normalized_distances = min_distances
+            
+        # Преобразование расстояния в уверенность
+        distance_conf = np.exp(-normalized_distances / 2)
+        
+        # Силуэтный анализ
+        if len(set(labels)) > 1:
+            try:
+                silhouette_vals = silhouette_samples(embeddings, labels)
+                silhouette_conf = (silhouette_vals + 1) / 2  # Преобразуем из [-1,1] в [0,1]
+            except:
+                silhouette_conf = np.ones(len(embeddings)) * 0.5
+        else:
+            silhouette_conf = np.ones(len(embeddings)) * 0.5
+            
+        # Комбинируем метрики с весами
+        confidence_scores = 0.5 * distance_conf + 0.5 * silhouette_conf
+        
+        # Нормализация с использованием квантилей для лучшего распределения
+        q05, q95 = np.quantile(confidence_scores, [0.05, 0.95])
+        if q95 > q05:
+            confidence_scores = (confidence_scores - q05) / (q95 - q05)
+            
+        return np.clip(confidence_scores, 0.1, 1.0)  # Минимальная уверенность 0.1
+
+    # Остальные методы остаются без изменений (extract_keywords, calculate_cluster_quality_metrics, analyze_clusters и т.д.)
+    # Для экономии места не дублируем их, они такие же как в предыдущей версии
+
+def main():
+    """Основная функция улучшенной кластеризации по первым сообщениям с HDBSCAN"""
+
+    # Конфигурация
+    CLUSTERING_FILE = "clustering_data.json"
+    ANALYSIS_FILE = "analysis_data_replaced.json"
+    OUTPUT_FILE = "clustering_results_hdbscan_improved.json"
+    CONFIDENCE_THRESHOLD = 0.3
+    TARGET_CLUSTERS_RANGE = (5, 15)  # Целевой диапазон количества кластеров
+
+    # Инициализация улучшенного кластеризатора
+    clusterer = FirstMessageClusteringHDBSCAN(use_umap=True)
+
+    # Загрузка данных с улучшенной фильтрацией
+    texts, dialog_info = clusterer.load_data(CLUSTERING_FILE, ANALYSIS_FILE)
+
+    if len(texts) < 3:
+        print("Недостаточно данных для кластеризации (нужно минимум 3 текста)")
+        return
+
+    # Создание и улучшение эмбеддингов
+    embeddings = clusterer.create_embeddings(texts)
+    
+    # Экспериментируем с разными параметрами UMAP для лучшего разделения
+    umap_configs = [
+        (15, 0.1),  # Стандартные параметры
+        (10, 0.05), # Меньше соседей, меньше минимальное расстояние = более локальная структура
+        (20, 0.2),  # Больше соседей, больше минимальное расстояние = более глобальная структура
+    ]
+    
+    best_embeddings = None
+    best_clusters = 0
+    
+    print("Тестирование разных конфигураций UMAP для лучшего разделения...")
+    for i, (neighbors, min_dist) in enumerate(umap_configs):
+        print(f"Конфигурация {i+1}: n_neighbors={neighbors}, min_dist={min_dist}")
+        embeddings_enhanced = clusterer.enhance_embeddings(
+            embeddings, umap_neighbors=neighbors, umap_min_dist=min_dist
+        )
+        
+        # Быстрая оценка потенциального количества кластеров
+        test_params = {'min_cluster_size': 3, 'min_samples': 1}
+        test_clusterer = HDBSCAN(**test_params)
+        test_labels = test_clusterer.fit_predict(embeddings_enhanced)
+        n_clusters = len(set(test_labels)) - (1 if -1 in test_labels else 0)
+        
+        print(f"  Потенциальное количество кластеров: {n_clusters}")
+        
+        if n_clusters > best_clusters:
+            best_clusters = n_clusters
+            best_embeddings = embeddings_enhanced
+    
+    if best_embeddings is not None:
+        embeddings_enhanced = best_embeddings
+        print(f"Выбрана конфигурация с потенциальным количеством кластеров: {best_clusters}")
+    else:
+        embeddings_enhanced = clusterer.enhance_embeddings(embeddings)
+        print("Используется стандартная конфигурация UMAP")
+
+    # Кластеризация HDBSCAN с целевым диапазоном кластеров
+    labels, clusterer_model, confidence_scores = clusterer.perform_advanced_hdbscan_clustering(
+        embeddings_enhanced, TARGET_CLUSTERS_RANGE
+    )
+
+    # Расчет метрик качества кластеров
+    cluster_metrics = clusterer.calculate_cluster_quality_metrics(embeddings_enhanced, labels, confidence_scores)
+
+    # Анализ кластеров
+    cluster_analysis = clusterer.analyze_clusters(texts, labels, dialog_info, confidence_scores, cluster_metrics)
+
+    # Визуализация
+    clusterer.visualize_clusters(embeddings_enhanced, labels, cluster_analysis, confidence_scores)
+
+    # Сохранение результатов
+    results, high_confidence_results = clusterer.save_results(
+        dialog_info, labels, confidence_scores, cluster_analysis,
+        OUTPUT_FILE, CONFIDENCE_THRESHOLD
+    )
+
+    print(f"\nКластеризация завершена!")
+    print(f"Полные результаты сохранены в {OUTPUT_FILE}")
+    print(f"Результаты с высокой уверенностью (порог {CONFIDENCE_THRESHOLD}) сохранены в {OUTPUT_FILE.replace('.json', '_high_confidence.json')}")
+    print(f"Сводный отчет по кластерам: cluster_summary_hdbscan_improved.json")
+
+    # Анализ распределения уверенности
+    print(f"\nАнализ уверенности:")
+    print(f"  Средняя уверенность: {np.mean(confidence_scores):.3f}")
+    print(f"  Медианная уверенность: {np.median(confidence_scores):.3f}")
+    print(f"  Стандартное отклонение: {np.std(confidence_scores):.3f}")
+    print(f"  Минимальная уверенность: {np.min(confidence_scores):.3f}")
+    print(f"  Максимальная уверенность: {np.max(confidence_scores):.3f}")
+
+if __name__ == "__main__":
+    main()
