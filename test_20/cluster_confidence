@@ -1,4 +1,4 @@
-# clustering_first_messages_fixed.py
+# clustering_first_messages_fixed_v2.py
 import json
 import pandas as pd
 import numpy as np
@@ -13,7 +13,7 @@ import re
 from tqdm import tqdm
 import os
 
-class FirstMessageClusteringFixed:
+class FirstMessageClusteringFixedV2:
     def __init__(self, model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'):
         """Инициализация модели для создания эмбеддингов"""
         print(f"Загрузка модели {model_name}")
@@ -126,7 +126,38 @@ class FirstMessageClusteringFixed:
         print(f"  Силуэтный анализ: {silhouette_k}")
         print(f"  Выбрано: {optimal_k}")
         
+        # Визуализация выбора k
+        self._plot_optimal_clusters(k_range, wcss, silhouette_scores, elbow_k, silhouette_k)
+        
         return optimal_k
+    
+    def _plot_optimal_clusters(self, k_range, wcss, silhouette_scores, elbow_k, silhouette_k):
+        """Визуализация выбора оптимального количества кластеров"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        
+        # График метода локтя
+        ax1.plot(k_range, wcss, 'bo-')
+        ax1.axvline(x=elbow_k, color='red', linestyle='--', alpha=0.7, label=f'Локоть: k={elbow_k}')
+        ax1.set_xlabel('Количество кластеров')
+        ax1.set_ylabel('WCSS (Within-Cluster Sum of Square)')
+        ax1.set_title('Метод локтя')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # График силуэтного анализа
+        ax2.plot(k_range, silhouette_scores, 'go-')
+        ax2.axvline(x=silhouette_k, color='red', linestyle='--', alpha=0.7, label=f'Оптимум: k={silhouette_k}')
+        ax2.set_xlabel('Количество кластеров')
+        ax2.set_ylabel('Silhouette Score')
+        ax2.set_title('Силуэтный анализ')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('clustering_optimal_k_first_messages.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print("График выбора оптимального k сохранен: clustering_optimal_k_first_messages.png")
     
     def perform_clustering(self, embeddings, n_clusters=None):
         """Выполнение кластеризации K-means с улучшенным расчетом уверенности"""
@@ -231,11 +262,11 @@ class FirstMessageClusteringFixed:
             
             cluster_metrics[cluster_id] = {
                 'size': len(cluster_indices),
-                'avg_confidence': avg_confidence,
-                'cohesion': cohesion,
-                'relative_cohesion': relative_cohesion,
-                'silhouette_score': cluster_silhouette,
-                'quality_score': avg_confidence * (1 - relative_cohesion)  # Композитная оценка качества
+                'avg_confidence': float(avg_confidence),
+                'cohesion': float(cohesion),
+                'relative_cohesion': float(relative_cohesion),
+                'silhouette_score': float(cluster_silhouette),
+                'quality_score': float(avg_confidence * (1 - relative_cohesion))  # Композитная оценка качества
             }
         
         return cluster_metrics
@@ -247,6 +278,9 @@ class FirstMessageClusteringFixed:
         cluster_analysis = {}
         
         for cluster_id in set(labels):
+            # ИСПРАВЛЕНИЕ: преобразуем numpy.int32 в стандартный int
+            cluster_id_int = int(cluster_id)
+            
             cluster_indices = [i for i, label in enumerate(labels) if label == cluster_id]
             cluster_texts = [texts[i] for i in cluster_indices]
             cluster_dialogs = [dialog_info[i] for i in cluster_indices]
@@ -266,14 +300,14 @@ class FirstMessageClusteringFixed:
             # Анализ тематик исходных диалогов
             topic_stats = self._analyze_topics(cluster_dialogs)
             
-            cluster_analysis[cluster_id] = {
+            cluster_analysis[cluster_id_int] = {
                 'size': len(cluster_texts),
                 'keywords': keywords,
                 'best_examples': best_examples,  # Наиболее типичные сообщения
                 'worst_examples': worst_examples,  # Наименее типичные сообщения
                 'metka_stats': metka_stats,
                 'topic_stats': topic_stats,
-                'avg_message_length': np.mean([len(text) for text in cluster_texts]),
+                'avg_message_length': float(np.mean([len(text) for text in cluster_texts])),
                 'metrics': cluster_metrics[cluster_id]
             }
         
@@ -293,13 +327,98 @@ class FirstMessageClusteringFixed:
         
         # Возвращаем только метки, которые встречаются хотя бы в 10% текстов
         threshold = len(texts) * 0.1
-        return {k: v for k, v in metka_counts.items() if v > threshold}
+        # ИСПРАВЛЕНИЕ: преобразуем значения в int
+        return {k: int(v) for k, v in metka_counts.items() if v > threshold}
     
     def _analyze_topics(self, dialogs):
         """Анализ распределения исходных тематик в кластере"""
         topics = [dialog.get('original_topic', 'unknown') for dialog in dialogs]
         topic_counts = Counter(topics)
-        return dict(topic_counts.most_common(10))
+        # ИСПРАВЛЕНИЕ: преобразуем значения в int
+        return {k: int(v) for k, v in dict(topic_counts.most_common(10)).items()}
+    
+    def visualize_clusters(self, embeddings, labels, cluster_analysis, confidence_scores):
+        """Визуализация кластеров с помощью PCA с учетом уверенности"""
+        print("Визуализация кластеров...")
+        
+        # PCA для визуализации
+        pca = PCA(n_components=2, random_state=42)
+        embeddings_2d = pca.fit_transform(embeddings)
+        
+        # Создаем DataFrame для удобства построения графиков
+        df = pd.DataFrame({
+            'x': embeddings_2d[:, 0],
+            'y': embeddings_2d[:, 1],
+            'cluster': labels,
+            'confidence': confidence_scores
+        })
+        
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(20, 16))
+        
+        # 1. Точечная диаграмма кластеров с цветом по уверенности
+        scatter = ax1.scatter(df['x'], df['y'], c=df['cluster'], cmap='tab10', 
+                            alpha=0.7, s=50)
+        ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+        ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+        ax1.set_title('Визуализация кластеров (PCA)')
+        ax1.legend(*scatter.legend_elements(), title="Кластеры")
+        ax1.grid(True, alpha=0.3)
+        
+        # 2. Точечная диаграмма с прозрачностью по уверенности
+        scatter2 = ax2.scatter(df['x'], df['y'], c=df['cluster'], cmap='tab10',
+                             alpha=df['confidence'], s=50)
+        ax2.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+        ax2.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+        ax2.set_title('Уверенность принадлежности к кластеру\n(альфа-канал = уверенность)')
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. Размеры кластеров и средняя уверенность
+        cluster_sizes = {k: v['size'] for k, v in cluster_analysis.items()}
+        cluster_confidences = {k: v['metrics']['avg_confidence'] for k, v in cluster_analysis.items()}
+        
+        clusters = list(cluster_sizes.keys())
+        sizes = list(cluster_sizes.values())
+        confidences = [cluster_confidences[k] for k in clusters]
+        
+        bars = ax3.bar(clusters, sizes, color=plt.cm.tab10(range(len(clusters))), alpha=0.7)
+        ax3.set_xlabel('Номер кластера')
+        ax3.set_ylabel('Количество диалогов', color='blue')
+        ax3.tick_params(axis='y', labelcolor='blue')
+        ax3.set_title('Распределение диалогов по кластерам')
+        
+        # Добавляем линию уверенности
+        ax3_conf = ax3.twinx()
+        ax3_conf.plot(clusters, confidences, 'ro-', linewidth=2, markersize=8, label='Средняя уверенность')
+        ax3_conf.set_ylabel('Средняя уверенность', color='red')
+        ax3_conf.tick_params(axis='y', labelcolor='red')
+        ax3_conf.set_ylim(0, 1)
+        ax3_conf.legend(loc='upper right')
+        
+        # 4. Качество кластеров
+        quality_scores = [cluster_analysis[k]['metrics']['quality_score'] for k in clusters]
+        cohesion_scores = [cluster_analysis[k]['metrics']['relative_cohesion'] for k in clusters]
+        
+        x_pos = np.arange(len(clusters))
+        width = 0.35
+        
+        ax4.bar(x_pos - width/2, quality_scores, width, label='Оценка качества', alpha=0.7)
+        ax4.bar(x_pos + width/2, cohesion_scores, width, label='Относительная когезия', alpha=0.7)
+        ax4.set_xlabel('Номер кластера')
+        ax4.set_ylabel('Оценка')
+        ax4.set_title('Качество кластеров')
+        ax4.set_xticks(x_pos)
+        ax4.set_xticklabels(clusters)
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('clustering_visualization_first_messages_enhanced.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print("Графики кластеризации сохранены: clustering_visualization_first_messages_enhanced.png")
+        
+        # Выводим информацию о PCA
+        print(f"PCA объясненная дисперсия: PC1={pca.explained_variance_ratio_[0]:.2%}, PC2={pca.explained_variance_ratio_[1]:.2%}")
     
     def save_results(self, dialog_info, labels, confidence_scores, cluster_analysis, output_file, confidence_threshold=0.5):
         """Сохранение результатов кластеризации с дополнительной информацией"""
@@ -307,14 +426,16 @@ class FirstMessageClusteringFixed:
         
         results = []
         for i, (item, label, confidence) in enumerate(zip(dialog_info, labels, confidence_scores)):
-            cluster_data = cluster_analysis[label]
+            # ИСПРАВЛЕНИЕ: преобразуем numpy.int32 в стандартный int
+            label_int = int(label)
+            cluster_data = cluster_analysis[label_int]
             
             # ИСПРАВЛЕНИЕ: преобразуем bool в int для сериализации JSON
             is_typical_example = confidence > confidence_threshold
             
             results.append({
                 'dialog_id': item['dialog_id'],
-                'cluster_id': int(label),
+                'cluster_id': label_int,
                 'cluster_size': cluster_data['size'],
                 'confidence_score': float(confidence),
                 'confidence_level': self._get_confidence_level(confidence),
@@ -375,7 +496,7 @@ class FirstMessageClusteringFixed:
         
         for cluster_id, analysis in cluster_analysis.items():
             # ИСПРАВЛЕНИЕ: убеждаемся, что все значения сериализуемы
-            summary[cluster_id] = {
+            summary[int(cluster_id)] = {  # Преобразуем ключ в int
                 'size': analysis['size'],
                 'quality_metrics': {
                     'quality_score': float(analysis['metrics']['quality_score']),
@@ -470,11 +591,11 @@ def main():
     NUM_CLUSTERS = None  # Автоопределение
     
     print("=" * 80)
-    print("УЛУЧШЕННАЯ КЛАСТЕРИЗАЦИЯ ПО ПЕРВЫМ СООБЩЕНИЯМ (ИСПРАВЛЕННАЯ)")
+    print("УЛУЧШЕННАЯ КЛАСТЕРИЗАЦИЯ ПО ПЕРВЫМ СООБЩЕНИЯМ (ИСПРАВЛЕННАЯ V2)")
     print("=" * 80)
     
     # Инициализация улучшенного кластеризатора
-    clusterer = FirstMessageClusteringFixed()
+    clusterer = FirstMessageClusteringFixedV2()
     
     # Загрузка данных
     texts, dialog_info = clusterer.load_data(CLUSTERING_FILE, ANALYSIS_FILE)
@@ -498,6 +619,9 @@ def main():
     
     # Анализ кластеров
     cluster_analysis = clusterer.analyze_clusters(texts, labels, dialog_info, confidence_scores, cluster_metrics)
+    
+    # Визуализация
+    clusterer.visualize_clusters(embeddings, labels, cluster_analysis, confidence_scores)
     
     # Сохранение результатов (два файла: полный и с высокой уверенностью)
     results, high_confidence_results = clusterer.save_results(
