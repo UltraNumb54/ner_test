@@ -34,6 +34,12 @@ class ClusterAnalyzer:
             '[LK_NUM]': '[Номер лицевого счёта]'
         }
         
+        # Словарь для перевода ролей
+        self.role_translations = {
+            'user': 'Пользователь',
+            'assistant': 'Ассистент'
+        }
+        
         # Проверяем подключение
         try:
             # Простой тестовый запрос для проверки подключения
@@ -67,9 +73,58 @@ class ClusterAnalyzer:
         
         return text
     
+    def format_dialog_for_display(self, messages: List[Dict]) -> str:
+        """
+        Форматирует диалог для отображения в виде:
+        Роль: текст
+        Роль: текст
+        """
+        formatted_dialog = ""
+        
+        for msg in messages:
+            role = msg.get('role', 'unknown')
+            # Переводим роль на русский
+            translated_role = self.role_translations.get(role, role)
+            
+            # Используем текст с заменами для анализа
+            text = msg.get('text_replaced', '') or msg.get('text', '')
+            # Применяем перевод меток
+            processed_text = self.translate_and_merge_metkas(text)
+            
+            formatted_dialog += f"{translated_role}: {processed_text}\n"
+        
+        return formatted_dialog.strip()
+    
+    def format_dialog_for_final_file(self, messages: List[Dict]) -> Dict:
+        """
+        Форматирует диалог для сохранения в финальном файле
+        """
+        dialog_data = {
+            'messages': []
+        }
+        
+        for msg in messages:
+            role = msg.get('role', 'unknown')
+            translated_role = self.role_translations.get(role, role)
+            
+            # Текст с заменами (для анализа)
+            text_replaced = msg.get('text_replaced', '') or msg.get('text', '')
+            processed_text = self.translate_and_merge_metkas(text_replaced)
+            
+            # Оригинальный текст
+            original_text = msg.get('text_original', '') or msg.get('text', '')
+            
+            dialog_data['messages'].append({
+                'role': translated_role,
+                'text_for_analysis': processed_text,
+                'original_text': original_text
+            })
+        
+        return dialog_data
+    
     def create_simple_prompt(self, cluster_id: int, dialogs: List[Dict]) -> str:
         """
-        Создание УПРОЩЕННОГО промпта для анализа кластера (3 примера)
+        Создание УПРОЩЕННОГО промпта для анализа кластера (3 примера полных диалогов)
         """
         # Выбираем 3 случайных диалога из кластера для анализа
         sample_dialogs = random.sample(dialogs, min(3, len(dialogs)))
@@ -80,28 +135,26 @@ class ClusterAnalyzer:
         for i, dialog in enumerate(sample_dialogs):
             dialog_id = dialog.get('dialog_id', f'unknown_{i}')
             
-            # Получаем первое сообщение с заменами для анализа
-            first_message = dialog.get('first_message_replaced', '') or dialog.get('text', '')
-            
-            # Получаем оригинальный текст для сохранения в финальном файле
-            original_text = ""
+            # Получаем полный диалог с сообщениями
             full_dialog = dialog.get('full_dialog', {})
-            if full_dialog and 'messages' in full_dialog:
-                for msg in full_dialog['messages']:
-                    if msg.get('role') == 'user' and msg.get('text_original'):
-                        original_text = msg['text_original']
-                        break
+            messages = full_dialog.get('messages', [])
             
-            # Применяем перевод и объединение меток
-            processed_text = self.translate_and_merge_metkas(first_message)
+            if not messages:
+                # Если нет структуры messages, пытаемся получить из других полей
+                first_message = dialog.get('first_message_replaced', '')
+                if first_message:
+                    messages = [{'role': 'user', 'text_replaced': first_message}]
             
-            dialogs_text += f"Пример {i+1}:\n{processed_text}\n\n"
+            # Форматируем диалог для промпта
+            formatted_dialog = self.format_dialog_for_display(messages)
+            
+            dialogs_text += f"Пример {i+1} (ID: {dialog_id}):\n{formatted_dialog}\n\n"
             
             # Сохраняем пример для финального файла
+            dialog_for_file = self.format_dialog_for_final_file(messages)
             analysis_examples.append({
                 'dialog_id': dialog_id,
-                'text_for_analysis': processed_text,  # Текст, отправленный в LLM
-                'original_text': original_text  # Оригинальный текст
+                'dialog_for_analysis': dialog_for_file
             })
         
         prompt = f"""Проанализируй эти диалоги и создай инструкции для ассистента:
@@ -146,7 +199,7 @@ class ClusterAnalyzer:
     
     def analyze_cluster(self, cluster_id: int, dialogs: List[Dict]) -> Dict[str, Any]:
         """
-        Анализ одного кластера с помощью LLM (только 3 примера)
+        Анализ одного кластера с помощью LLM (только 3 примера полных диалогов)
         """
         print(f"Анализ кластера {cluster_id}...")
         
@@ -195,22 +248,19 @@ class ClusterAnalyzer:
         
         for i, dialog in enumerate(sample_dialogs):
             dialog_id = dialog.get('dialog_id', f'unknown_{i}')
-            first_message = dialog.get('first_message_replaced', '') or dialog.get('text', '')
             
-            original_text = ""
             full_dialog = dialog.get('full_dialog', {})
-            if full_dialog and 'messages' in full_dialog:
-                for msg in full_dialog['messages']:
-                    if msg.get('role') == 'user' and msg.get('text_original'):
-                        original_text = msg['text_original']
-                        break
+            messages = full_dialog.get('messages', [])
             
-            processed_text = self.translate_and_merge_metkas(first_message)
+            if not messages:
+                first_message = dialog.get('first_message_replaced', '')
+                if first_message:
+                    messages = [{'role': 'user', 'text_replaced': first_message}]
             
+            dialog_for_file = self.format_dialog_for_final_file(messages)
             analysis_examples.append({
                 'dialog_id': dialog_id,
-                'text_for_analysis': processed_text,
-                'original_text': original_text
+                'dialog_for_analysis': dialog_for_file
             })
         
         return {
@@ -293,7 +343,7 @@ class ClusterAnalyzer:
         Анализ всех кластеров и сохранение в JSON и TXT
         """
         print(f"Начало анализа {len(clusters_data)} кластеров...")
-        print(f"На анализ будет отправлено по 3 примера из каждого кластера")
+        print(f"На анализ будет отправлено по 3 полных диалога из каждого кластера")
         
         results = {}
         
@@ -316,11 +366,12 @@ class ClusterAnalyzer:
         output_data = {
             'analysis_timestamp': datetime.now().isoformat(),
             'total_clusters_analyzed': len(results),
-            'model_used': 'Qwen2.5-7B-Instruct-AWQ (через API)',
+            'model_used': 'Qwen3-8B-AWQ',
             'metka_translations_applied': self.metka_translations,
             'analysis_parameters': {
                 'examples_per_cluster': 3,
-                'prompt_type': 'simple'
+                'prompt_type': 'simple',
+                'dialog_format': 'full_dialog_with_roles'
             },
             'clusters': results
         }
@@ -336,15 +387,7 @@ class ClusterAnalyzer:
         """
         print(f"Сохранение TXT результатов в {output_file}...")
         
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write("АНАЛИЗ КЛАСТЕРОВ ДИАЛОГОВ\n")
-            f.write("=" * 60 + "\n\n")
-            f.write(f"Время анализа: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Количество кластеров: {len(results)}\n")
-            f.write(f"Модель: Qwen2.5-7B-Instruct-AWQ (через API)\n")
-            f.write(f"Примеров на кластер: 3\n")
-            f.write(f"Применены переводы меток: {', '.join(self.metka_translations.values())}\n\n")
-            
+        with open(output_file, 'w', encoding='utf-8') as f:         
             for cluster_id, analysis in results.items():
                 f.write(f"КЛАСТЕР {cluster_id}: {analysis.get('cluster_name', 'Нет названия')}\n")
                 f.write("=" * 60 + "\n")
@@ -377,9 +420,20 @@ class ClusterAnalyzer:
                 examples = analysis.get('analysis_examples', [])
                 for i, example in enumerate(examples, 1):
                     f.write(f"Пример {i} (ID: {example.get('dialog_id', 'unknown')}):\n")
-                    f.write(f"Текст для анализа: {example.get('text_for_analysis', '')}\n")
-                    f.write(f"Оригинальный текст: {example.get('original_text', '')}\n")
-                    f.write("-" * 20 + "\n")
+                    
+                    dialog_data = example.get('dialog_for_analysis', {})
+                    messages = dialog_data.get('messages', [])
+                    
+                    for msg in messages:
+                        role = msg.get('role', 'Неизвестно')
+                        text_for_analysis = msg.get('text_for_analysis', '')
+                        original_text = msg.get('original_text', '')
+                        
+                        f.write(f"  {role}: {text_for_analysis}\n")
+                        if original_text and original_text != text_for_analysis:
+                            f.write(f"    [Оригинал: {original_text}]\n")
+                    
+                    f.write("-" * 40 + "\n")
                 f.write("\n")
                 
                 f.write("ПОЛНЫЙ ОТВЕТ МОДЕЛИ:\n")
@@ -463,25 +517,6 @@ def post_process_files(output_base_name: str):
         
         print(f"TXT файл очищен: {txt_file}")
 
-def calculate_llm_cost_per_cluster(examples_per_cluster: int = 3):
-    """
-    Расчет примерной стоимости анализа одного кластера в LLM
-    """
-    # Примерные оценки (зависит от модели и провайдера)
-    avg_input_tokens_per_example = 100  # Среднее количество токенов на пример
-    avg_output_tokens_per_cluster = 500  # Среднее количество токенов в ответе
-    
-    total_input_tokens = examples_per_cluster * avg_input_tokens_per_example
-    total_tokens = total_input_tokens + avg_output_tokens_per_cluster
-    
-    print(f"ОЦЕНКА СТОИМОСТИ АНАЛИЗА ОДНОГО КЛАСТЕРА:")
-    print(f"  Примеров на кластер: {examples_per_cluster}")
-    print(f"  Примерное количество токенов: {total_tokens}")
-    print(f"  Для локальной модели стоимость = 0 рублей")
-    print(f"  Для облачных моделей стоимость зависит от провайдера")
-    
-    return total_tokens
-
 def main():
     """
     Основная функция
@@ -494,13 +529,6 @@ def main():
     EXAMPLES_PER_CLUSTER = 3  # Количество примеров для анализа на кластер
     # ======================================================
     
-    print("=" * 60)
-    print("АНАЛИЗ КЛАСТЕРОВ С ПОДКЛЮЧЕНИЕМ К ЗАПУЩЕННОЙ МОДЕЛИ")
-    print("=" * 60)
-    
-    # Расчет стоимости
-    calculate_llm_cost_per_cluster(EXAMPLES_PER_CLUSTER)
-    print()
     
     if not os.path.exists(INPUT_FILE):
         print(f"Ошибка: файл {INPUT_FILE} не найден!")
@@ -518,14 +546,6 @@ def main():
         results = analyzer.analyze_all_clusters(clusters_data, OUTPUT_BASE_NAME)
         post_process_files(OUTPUT_BASE_NAME)
         
-        print(f"\nАнализ завершен! Результаты сохранены в:")
-        print(f"  {OUTPUT_BASE_NAME}.json - структурированные данные с примерами")
-        print(f"  {OUTPUT_BASE_NAME}.txt - читаемое описание с примерами")
-        print(f"\nОсобенности реализации:")
-        print(f"  • Отправляется по {EXAMPLES_PER_CLUSTER} примера на кластер")
-        print(f"  • Упрощенный промпт для лучшего понимания")
-        print(f"  • В финальные файлы добавлены оригинальные тексты и тексты с заменами")
-        print(f"  • Локальное решение с нулевой стоимостью")
         
     except Exception as e:
         print(f"Ошибка при выполнении анализа: {e}")
