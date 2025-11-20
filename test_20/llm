@@ -1,0 +1,536 @@
+# analyze_clusters_with_llm_final.py
+import json
+import os
+import re
+from openai import OpenAI
+import time
+from typing import Dict, List, Any
+from datetime import datetime
+import random
+
+class ClusterAnalyzer:
+    def __init__(self, base_url: str = "http://localhost:8000/v1", api_key: str = "EMPTY"):
+        """
+        Инициализация анализатора кластеров с подключением к запущенной модели через API
+        """
+        print(f"Подключение к модели по адресу {base_url}...")
+        
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key
+        )
+        
+        # Словарь для замены английских меток на русские
+        self.metka_translations = {
+            '[FIO]': '[ФИО]',
+            '[PHONE]': '[Телефон]',
+            '[PHONE_NUM]': '[Телефон]',
+            '[EMAIL]': '[Email]',
+            '[DATE]': '[Дата]',
+            '[SUM]': '[Сумма]',
+            '[ORG]': '[Организация]',
+            '[LOC]': '[Адрес]',
+            '[READINGS]': '[Показания]',
+            '[LK_NUM]': '[Номер лицевого счёта]'
+        }
+        
+        # Проверяем подключение
+        try:
+            # Простой тестовый запрос для проверки подключения
+            test_response = self.client.chat.completions.create(
+                model="test",
+                messages=[{"role": "user", "content": "Привет"}],
+                max_tokens=10
+            )
+            print("Подключение к модели установлено успешно!")
+        except Exception as e:
+            print(f"Ошибка подключения к модели: {e}")
+            raise
+    
+    def translate_and_merge_metkas(self, text: str) -> str:
+        """
+        Заменяет английские метки на русские и объединяет подряд идущие одинаковые метки
+        """
+        # Сначала заменяем все английские метки на русские
+        for eng_metka, rus_metka in self.metka_translations.items():
+            text = text.replace(eng_metka, rus_metka)
+        
+        # Объединяем подряд идущие одинаковые русские метки
+        for rus_metka in self.metka_translations.values():
+            # Регулярное выражение для поиска 2+ подряд идущих одинаковых меток
+            pattern = f'({re.escape(rus_metka)}\\s*)+'
+            # Заменяем на одну метку
+            text = re.sub(pattern, rus_metka + ' ', text)
+        
+        # Убираем лишние пробелы
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+    
+    def create_simple_prompt(self, cluster_id: int, dialogs: List[Dict]) -> str:
+        """
+        Создание УПРОЩЕННОГО промпта для анализа кластера (3 примера)
+        """
+        # Выбираем 3 случайных диалога из кластера для анализа
+        sample_dialogs = random.sample(dialogs, min(3, len(dialogs)))
+        
+        dialogs_text = ""
+        analysis_examples = []  # Сохраняем примеры для финального файла
+        
+        for i, dialog in enumerate(sample_dialogs):
+            dialog_id = dialog.get('dialog_id', f'unknown_{i}')
+            
+            # Получаем первое сообщение с заменами для анализа
+            first_message = dialog.get('first_message_replaced', '') or dialog.get('text', '')
+            
+            # Получаем оригинальный текст для сохранения в финальном файле
+            original_text = ""
+            full_dialog = dialog.get('full_dialog', {})
+            if full_dialog and 'messages' in full_dialog:
+                for msg in full_dialog['messages']:
+                    if msg.get('role') == 'user' and msg.get('text_original'):
+                        original_text = msg['text_original']
+                        break
+            
+            # Применяем перевод и объединение меток
+            processed_text = self.translate_and_merge_metkas(first_message)
+            
+            dialogs_text += f"Пример {i+1}:\n{processed_text}\n\n"
+            
+            # Сохраняем пример для финального файла
+            analysis_examples.append({
+                'dialog_id': dialog_id,
+                'text_for_analysis': processed_text,  # Текст, отправленный в LLM
+                'original_text': original_text  # Оригинальный текст
+            })
+        
+        prompt = f"""Проанализируй эти диалоги и создай инструкции для ассистента:
+
+{dialogs_text}
+
+Создай структурированное описание по шаблону:
+
+Название: [краткое название кластера]
+Описание: [1-2 предложения о тематике]
+
+Ключевые проблемы пользователей:
+1. [проблема 1]
+2. [проблема 2]
+3. [проблема 3]
+
+Что нужно ассистенту для решения:
+1. [действие 1 с примером]
+2. [действие 2 с примером]
+3. [действие 3 с примером]"""
+
+        return prompt, analysis_examples
+    
+    def remove_think_tags(self, text: str) -> str:
+        """
+        Удаляет все содержимое между <think> и </think> тегами
+        """
+        cleaned_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        cleaned_text = re.sub(r'<think>.*?$', '', cleaned_text, flags=re.DOTALL)
+        cleaned_text = re.sub(r'^.*?</think>', '', cleaned_text, flags=re.DOTALL)
+        return cleaned_text.strip()
+    
+    def clean_response(self, response: str) -> str:
+        """
+        Очистка ответа от нежелательных тегов и разметки
+        """
+        response = self.remove_think_tags(response)
+        response = re.sub(r'<\|im_start\|>.*?<\|im_end\|>', '', response, flags=re.DOTALL)
+        response = re.sub(r'<\/?[a-zA-Z]+>', '', response)
+        response = re.sub(r'\n\s*\n', '\n\n', response)
+        return response.strip()
+    
+    def analyze_cluster(self, cluster_id: int, dialogs: List[Dict]) -> Dict[str, Any]:
+        """
+        Анализ одного кластера с помощью LLM (только 3 примера)
+        """
+        print(f"Анализ кластера {cluster_id}...")
+        
+        try:
+            prompt, analysis_examples = self.create_simple_prompt(cluster_id, dialogs)
+            
+            # Отправляем запрос к API модели
+            response = self.client.chat.completions.create(
+                model="qwen",  # Имя модели может быть любым, если сервер обслуживает одну модель
+                messages=[
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                top_p=0.9,
+                max_tokens=2048,
+                stop=["<|im_end|>", "<|endoftext|>"]
+            )
+            
+            raw_response = response.choices[0].message.content
+            cleaned_response = self.clean_response(raw_response)
+            analysis = self.parse_simple_response(cleaned_response, cluster_id)
+            
+            # Сохраняем дополнительную информацию
+            analysis['raw_response_cleaned'] = cleaned_response
+            analysis['analysis_examples'] = analysis_examples  # Примеры, отправленные на анализ
+            analysis['cluster_stats'] = {
+                'total_dialogs_in_cluster': len(dialogs),
+                'dialogs_analyzed_count': len(analysis_examples),
+                'cluster_id': cluster_id
+            }
+            
+            print(f"Кластер {cluster_id} проанализирован успешно!")
+            return analysis
+            
+        except Exception as e:
+            print(f"Ошибка при анализе кластера {cluster_id}: {e}")
+            return self.create_error_response(cluster_id, dialogs, str(e))
+    
+    def create_error_response(self, cluster_id: int, dialogs: List[Dict], error_msg: str) -> Dict[str, Any]:
+        """
+        Создание ответа об ошибке
+        """
+        # Все равно создаем примеры для финального файла даже при ошибке
+        sample_dialogs = random.sample(dialogs, min(3, len(dialogs)))
+        analysis_examples = []
+        
+        for i, dialog in enumerate(sample_dialogs):
+            dialog_id = dialog.get('dialog_id', f'unknown_{i}')
+            first_message = dialog.get('first_message_replaced', '') or dialog.get('text', '')
+            
+            original_text = ""
+            full_dialog = dialog.get('full_dialog', {})
+            if full_dialog and 'messages' in full_dialog:
+                for msg in full_dialog['messages']:
+                    if msg.get('role') == 'user' and msg.get('text_original'):
+                        original_text = msg['text_original']
+                        break
+            
+            processed_text = self.translate_and_merge_metkas(first_message)
+            
+            analysis_examples.append({
+                'dialog_id': dialog_id,
+                'text_for_analysis': processed_text,
+                'original_text': original_text
+            })
+        
+        return {
+            'cluster_name': f"Кластер_{cluster_id}_Ошибка",
+            'description': f"Ошибка анализа: {error_msg}",
+            'user_problems': [],
+            'assistant_requirements': [],
+            'raw_response_cleaned': f"Ошибка: {error_msg}",
+            'analysis_examples': analysis_examples,
+            'cluster_stats': {
+                'total_dialogs_in_cluster': len(dialogs),
+                'dialogs_analyzed_count': len(analysis_examples),
+                'cluster_id': cluster_id
+            }
+        }
+    
+    def parse_simple_response(self, response: str, cluster_id: int) -> Dict[str, Any]:
+        """
+        Парсинг упрощенного ответа от модели
+        """
+        parsed = {
+            'cluster_name': f"Кластер_{cluster_id}",
+            'description': '',
+            'user_problems': [],
+            'assistant_requirements': []
+        }
+        
+        try:
+            # Извлекаем название
+            name_match = re.search(r'Название:\s*(.+)', response)
+            if name_match:
+                parsed['cluster_name'] = name_match.group(1).strip()
+            
+            # Извлекаем описание
+            desc_match = re.search(r'Описание:\s*(.+?)(?=Ключевые проблемы пользователей:|Что нужно ассистенту для решения:|$)', response, re.DOTALL)
+            if desc_match:
+                parsed['description'] = desc_match.group(1).strip()
+            
+            # Извлекаем проблемы пользователей
+            problems_match = re.search(r'Ключевые проблемы пользователей:\s*(.+?)(?=Что нужно ассистенту для решения:|$)', response, re.DOTALL)
+            if problems_match:
+                problems_text = problems_match.group(1)
+                parsed['user_problems'] = self.parse_numbered_items(problems_text)
+            
+            # Извлекаем требования к ассистенту
+            requirements_match = re.search(r'Что нужно ассистенту для решения:\s*(.+)', response, re.DOTALL)
+            if requirements_match:
+                requirements_text = requirements_match.group(1)
+                parsed['assistant_requirements'] = self.parse_numbered_items(requirements_text)
+            
+        except Exception as e:
+            print(f"Ошибка парсинга ответа для кластера {cluster_id}: {e}")
+            parsed['raw_response_cleaned'] = response
+        
+        return parsed
+    
+    def parse_numbered_items(self, text: str) -> List[str]:
+        """
+        Парсит нумерованные элементы из текста
+        """
+        items = []
+        lines = text.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            # Ищем паттерны типа "1. текст", "2) текст" и т.д.
+            match = re.match(r'^(\d+[\.\)]?\s*)(.+)', line)
+            if match:
+                item_text = match.group(2).strip()
+                if item_text and len(item_text) > 3:
+                    items.append(item_text)
+            elif line and not re.match(r'^\s*$', line) and len(line) > 10:
+                # Если строка не пустая и достаточно длинная, добавляем как есть
+                items.append(line)
+        
+        return items[:10]  # Ограничиваем максимум 10 элементами
+    
+    def analyze_all_clusters(self, clusters_data: Dict, output_base_name: str):
+        """
+        Анализ всех кластеров и сохранение в JSON и TXT
+        """
+        print(f"Начало анализа {len(clusters_data)} кластеров...")
+        print(f"На анализ будет отправлено по 3 примера из каждого кластера")
+        
+        results = {}
+        
+        for cluster_id, dialogs in clusters_data.items():
+            analysis = self.analyze_cluster(cluster_id, dialogs)
+            results[cluster_id] = analysis
+            time.sleep(1)  # Небольшая задержка между запросами
+        
+        self.save_json_results(results, f"{output_base_name}.json")
+        self.save_txt_results(results, f"{output_base_name}.txt")
+        
+        return results
+    
+    def save_json_results(self, results: Dict, output_file: str):
+        """
+        Сохранение результатов в JSON формате
+        """
+        print(f"Сохранение JSON результатов в {output_file}...")
+        
+        output_data = {
+            'analysis_timestamp': datetime.now().isoformat(),
+            'total_clusters_analyzed': len(results),
+            'model_used': 'Qwen2.5-7B-Instruct-AWQ (через API)',
+            'metka_translations_applied': self.metka_translations,
+            'analysis_parameters': {
+                'examples_per_cluster': 3,
+                'prompt_type': 'simple'
+            },
+            'clusters': results
+        }
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"JSON файл создан: {output_file}")
+    
+    def save_txt_results(self, results: Dict, output_file: str):
+        """
+        Сохранение результатов в читаемом TXT формате
+        """
+        print(f"Сохранение TXT результатов в {output_file}...")
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write("АНАЛИЗ КЛАСТЕРОВ ДИАЛОГОВ\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Время анализа: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Количество кластеров: {len(results)}\n")
+            f.write(f"Модель: Qwen2.5-7B-Instruct-AWQ (через API)\n")
+            f.write(f"Примеров на кластер: 3\n")
+            f.write(f"Применены переводы меток: {', '.join(self.metka_translations.values())}\n\n")
+            
+            for cluster_id, analysis in results.items():
+                f.write(f"КЛАСТЕР {cluster_id}: {analysis.get('cluster_name', 'Нет названия')}\n")
+                f.write("=" * 60 + "\n")
+                
+                stats = analysis.get('cluster_stats', {})
+                f.write(f"СТАТИСТИКА: {stats.get('dialogs_analyzed_count', 0)} примеров (всего в кластере: {stats.get('total_dialogs_in_cluster', 0)})\n\n")
+                
+                f.write("ОПИСАНИЕ:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"{analysis.get('description', 'Нет описания')}\n\n")
+                
+                f.write("КЛЮЧЕВЫЕ ПРОБЛЕМЫ ПОЛЬЗОВАТЕЛЕЙ:\n")
+                f.write("-" * 40 + "\n")
+                for i, problem in enumerate(analysis.get('user_problems', []), 1):
+                    f.write(f"{i}. {problem}\n")
+                if not analysis.get('user_problems'):
+                    f.write("Нет данных о проблемах\n")
+                f.write("\n")
+                
+                f.write("ЧТО НУЖНО АССИСТЕНТУ ДЛЯ РЕШЕНИЯ:\n")
+                f.write("-" * 40 + "\n")
+                for i, requirement in enumerate(analysis.get('assistant_requirements', []), 1):
+                    f.write(f"{i}. {requirement}\n")
+                if not analysis.get('assistant_requirements'):
+                    f.write("Нет данных о требованиях\n")
+                f.write("\n")
+                
+                f.write("ПРИМЕРЫ, ОТПРАВЛЕННЫЕ НА АНАЛИЗ:\n")
+                f.write("-" * 40 + "\n")
+                examples = analysis.get('analysis_examples', [])
+                for i, example in enumerate(examples, 1):
+                    f.write(f"Пример {i} (ID: {example.get('dialog_id', 'unknown')}):\n")
+                    f.write(f"Текст для анализа: {example.get('text_for_analysis', '')}\n")
+                    f.write(f"Оригинальный текст: {example.get('original_text', '')}\n")
+                    f.write("-" * 20 + "\n")
+                f.write("\n")
+                
+                f.write("ПОЛНЫЙ ОТВЕТ МОДЕЛИ:\n")
+                f.write("-" * 40 + "\n")
+                f.write(f"{analysis.get('raw_response_cleaned', 'Нет ответа')}\n")
+                
+                f.write("\n" + "=" * 80 + "\n\n")
+        
+        print(f"TXT файл создан: {output_file}")
+
+def load_cluster_data(input_file: str) -> Dict:
+    """
+    Загрузка данных кластеров
+    """
+    print(f"Загрузка данных из {input_file}...")
+    
+    with open(input_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    clusters = {}
+    
+    if isinstance(data, list):
+        for item in data:
+            cluster_id = item.get('cluster_id')
+            if cluster_id not in clusters:
+                clusters[cluster_id] = []
+            clusters[cluster_id].append(item)
+    elif isinstance(data, dict):
+        clusters = data
+    
+    print(f"Загружено {len(clusters)} кластеров")
+    
+    for cluster_id, dialogs in clusters.items():
+        print(f"  Кластер {cluster_id}: {len(dialogs)} диалогов")
+    
+    return clusters
+
+def post_process_files(output_base_name: str):
+    """
+    Пост-обработка файлов для удаления оставшихся think тегов
+    """
+    json_file = f"{output_base_name}.json"
+    txt_file = f"{output_base_name}.txt"
+    
+    print("Пост-обработка файлов для удаления think тегов...")
+    
+    def remove_think_tags(text):
+        return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    
+    # Обработка JSON файла
+    if os.path.exists(json_file):
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        def clean_json(obj):
+            if isinstance(obj, dict):
+                return {k: clean_json(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [clean_json(item) for item in obj]
+            elif isinstance(obj, str):
+                return remove_think_tags(obj)
+            else:
+                return obj
+        
+        cleaned_data = clean_json(data)
+        
+        with open(json_file, 'w', encoding='utf-8') as f:
+            json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"JSON файл очищен: {json_file}")
+    
+    # Обработка TXT файла
+    if os.path.exists(txt_file):
+        with open(txt_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        cleaned_content = remove_think_tags(content)
+        
+        with open(txt_file, 'w', encoding='utf-8') as f:
+            f.write(cleaned_content)
+        
+        print(f"TXT файл очищен: {txt_file}")
+
+def calculate_llm_cost_per_cluster(examples_per_cluster: int = 3):
+    """
+    Расчет примерной стоимости анализа одного кластера в LLM
+    """
+    # Примерные оценки (зависит от модели и провайдера)
+    avg_input_tokens_per_example = 100  # Среднее количество токенов на пример
+    avg_output_tokens_per_cluster = 500  # Среднее количество токенов в ответе
+    
+    total_input_tokens = examples_per_cluster * avg_input_tokens_per_example
+    total_tokens = total_input_tokens + avg_output_tokens_per_cluster
+    
+    print(f"ОЦЕНКА СТОИМОСТИ АНАЛИЗА ОДНОГО КЛАСТЕРА:")
+    print(f"  Примеров на кластер: {examples_per_cluster}")
+    print(f"  Примерное количество токенов: {total_tokens}")
+    print(f"  Для локальной модели стоимость = 0 рублей")
+    print(f"  Для облачных моделей стоимость зависит от провайдера")
+    
+    return total_tokens
+
+def main():
+    """
+    Основная функция
+    """
+    # ==================== КОНФИГУРАЦИЯ ====================
+    INPUT_FILE = "clustering_results_first_messages.json"  # Файл с результатами кластеризации
+    OUTPUT_BASE_NAME = "cluster_analysis_final"
+    API_BASE_URL = "http://localhost:8000/v1"  # URL запущенной модели
+    API_KEY = "EMPTY"  # Обычно "EMPTY" для локальных моделей
+    EXAMPLES_PER_CLUSTER = 3  # Количество примеров для анализа на кластер
+    # ======================================================
+    
+    print("=" * 60)
+    print("АНАЛИЗ КЛАСТЕРОВ С ПОДКЛЮЧЕНИЕМ К ЗАПУЩЕННОЙ МОДЕЛИ")
+    print("=" * 60)
+    
+    # Расчет стоимости
+    calculate_llm_cost_per_cluster(EXAMPLES_PER_CLUSTER)
+    print()
+    
+    if not os.path.exists(INPUT_FILE):
+        print(f"Ошибка: файл {INPUT_FILE} не найден!")
+        print("Сначала выполните кластеризацию (clustering_first_messages.py)")
+        return
+    
+    try:
+        clusters_data = load_cluster_data(INPUT_FILE)
+        
+        if not clusters_data:
+            print("Нет данных для анализа!")
+            return
+        
+        analyzer = ClusterAnalyzer(base_url=API_BASE_URL, api_key=API_KEY)
+        results = analyzer.analyze_all_clusters(clusters_data, OUTPUT_BASE_NAME)
+        post_process_files(OUTPUT_BASE_NAME)
+        
+        print(f"\nАнализ завершен! Результаты сохранены в:")
+        print(f"  {OUTPUT_BASE_NAME}.json - структурированные данные с примерами")
+        print(f"  {OUTPUT_BASE_NAME}.txt - читаемое описание с примерами")
+        print(f"\nОсобенности реализации:")
+        print(f"  • Отправляется по {EXAMPLES_PER_CLUSTER} примера на кластер")
+        print(f"  • Упрощенный промпт для лучшего понимания")
+        print(f"  • В финальные файлы добавлены оригинальные тексты и тексты с заменами")
+        print(f"  • Локальное решение с нулевой стоимостью")
+        
+    except Exception as e:
+        print(f"Ошибка при выполнении анализа: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
