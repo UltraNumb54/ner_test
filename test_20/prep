@@ -206,15 +206,16 @@ def extract_first_message(dialogue):
     
     return ""
 
-def create_two_files(input_file, model_path, output_analysis, output_clustering):
+def create_files(input_file, model_path, output_analysis_full, output_analysis_replaced_only, output_clustering):
     """
-    Создает два файла с разными форматами данных
+    Создает три файла с разными форматами данных
     
     Args:
         input_file: исходный JSON файл с диалогами
         model_path: путь к NER модели
-        output_analysis: файл для анализа (полный текст по ролям)
-        output_clustering: файл для кластеризации (id, первое сообщение, полный текст)
+        output_analysis_full: полная версия анализа (оригинал + замены)
+        output_analysis_replaced_only: упрощенная версия (только замены)
+        output_clustering: файл для кластеризации
     """
     print(f"Загрузка данных из {input_file}")
     
@@ -240,9 +241,10 @@ def create_two_files(input_file, model_path, output_analysis, output_clustering)
     # Инициализация заменщика сущностей
     replacer = EntityReplacer(model_path)
     
-    # Данные для двух файлов
-    analysis_data = []      # Для анализа: полный текст по ролям
-    clustering_data = []    # Для кластеризации: id, первое сообщение, полный текст
+    # Данные для файлов
+    analysis_full_data = []          # Полная версия анализа
+    analysis_replaced_only_data = [] # Упрощенная версия (только замены)
+    clustering_data = []             # Для кластеризации
     
     # Статистика
     stats = {
@@ -261,8 +263,16 @@ def create_two_files(input_file, model_path, output_analysis, output_clustering)
         # Извлекаем первое сообщение (оригинальное)
         first_message_original = extract_first_message(dialogue)
         
-        # Данные для анализа - полный текст по ролям
-        dialog_analysis = {
+        # Данные для полной версии анализа
+        dialog_analysis_full = {
+            'dialog_id': dialog_id,
+            'topic': topic,
+            'source': source,
+            'messages': []
+        }
+        
+        # Данные для упрощенной версии анализа
+        dialog_analysis_replaced_only = {
             'dialog_id': dialog_id,
             'topic': topic,
             'source': source,
@@ -303,13 +313,20 @@ def create_two_files(input_file, model_path, output_analysis, output_clustering)
                 stats['processed_messages'] += 1
                 stats['total_replacements'] += len(replacements)
             
-            # Сохраняем для анализа (оригинальный текст и с заменами по ролям)
-            message_analysis = {
+            # Сохраняем для полной версии анализа
+            message_analysis_full = {
                 'role': role,
                 'text_original': cleaned_text,
                 'text_replaced': replaced_text
             }
-            dialog_analysis['messages'].append(message_analysis)
+            dialog_analysis_full['messages'].append(message_analysis_full)
+            
+            # Сохраняем для упрощенной версии анализа (только замены)
+            message_analysis_replaced = {
+                'role': role,
+                'text_replaced': replaced_text
+            }
+            dialog_analysis_replaced_only['messages'].append(message_analysis_replaced)
             
             # Сохраняем тексты с заменами для полного текста
             all_messages_replaced.append(replaced_text)
@@ -323,20 +340,27 @@ def create_two_files(input_file, model_path, output_analysis, output_clustering)
             dialog_clustering['first_message_replaced'] = all_messages_replaced[0]
         
         # Добавляем в соответствующие списки
-        analysis_data.append(replacer.convert_to_serializable(dialog_analysis))
+        analysis_full_data.append(replacer.convert_to_serializable(dialog_analysis_full))
+        analysis_replaced_only_data.append(replacer.convert_to_serializable(dialog_analysis_replaced_only))
         clustering_data.append(replacer.convert_to_serializable(dialog_clustering))
     
-    # Сохранение двух файлов
+    # Сохранение файлов
     print("Сохранение файлов")
     
     try:
-        # 1. Файл анализа - полный текст по ролям
-        with open(output_analysis, 'w', encoding='utf-8') as f:
-            json.dump(analysis_data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
-        print(f"Файл анализа сохранен: {output_analysis}")
-        print(f"  Содержит: id, topic, source, messages[role, text_original, text_replaced]")
+        # 1. Полная версия анализа
+        with open(output_analysis_full, 'w', encoding='utf-8') as f:
+            json.dump(analysis_full_data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
+        print(f"Файл полного анализа сохранен: {output_analysis_full}")
+        print(f"  Содержит: dialog_id, topic, source, messages[role, text_original, text_replaced]")
         
-        # 2. Файл для кластеризации
+        # 2. Упрощенная версия анализа (только замены)
+        with open(output_analysis_replaced_only, 'w', encoding='utf-8') as f:
+            json.dump(analysis_replaced_only_data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
+        print(f"Файл упрощенного анализа сохранен: {output_analysis_replaced_only}")
+        print(f"  Содержит: dialog_id, topic, source, messages[role, text_replaced]")
+        
+        # 3. Файл для кластеризации
         with open(output_clustering, 'w', encoding='utf-8') as f:
             json.dump(clustering_data, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
         print(f"Файл для кластеризации сохранен: {output_clustering}")
@@ -348,13 +372,14 @@ def create_two_files(input_file, model_path, output_analysis, output_clustering)
         print(f"  Всего сообщений: {stats['total_messages']}")
         print(f"  Сообщений с заменами: {stats['processed_messages']}")
         print(f"  Всего замен: {stats['total_replacements']}")
+        print(f"  Файлов создано: 3")
         
     except Exception as e:
         print(f"Ошибка сохранения файлов: {e}")
         import traceback
         traceback.print_exc()
     
-    return analysis_data, clustering_data
+    return analysis_full_data, analysis_replaced_only_data, clustering_data
 
 def main():
     """Основная функция"""
@@ -362,28 +387,20 @@ def main():
     # Конфигурация
     INPUT_FILE = "input_data.json"
     MODEL_PATH = "ner-final-model"
-    OUTPUT_ANALYSIS = "analysis_data.json"
+    OUTPUT_ANALYSIS_FULL = "analysis_data_full.json"           # Полная версия
+    OUTPUT_ANALYSIS_REPLACED_ONLY = "analysis_data_replaced.json"  # Только замены
     OUTPUT_CLUSTERING = "clustering_data.json"
     
-    print("=" * 60)
-    print("СОЗДАНИЕ ДВУХ ФАЙЛОВ ДЛЯ АНАЛИЗА И КЛАСТЕРИЗАЦИИ")
-    print("=" * 60)
-    print(f"Входной файл: {INPUT_FILE}")
-    print(f"Модель: {MODEL_PATH}")
-    print(f"Выходные файлы:")
-    print(f"  Анализ: {OUTPUT_ANALYSIS}")
-    print(f"  Кластеризация: {OUTPUT_CLUSTERING}")
-    print("=" * 60)
-    
     # Создаем папки для выходных файлов если не существуют
-    for output_file in [OUTPUT_ANALYSIS, OUTPUT_CLUSTERING]:
+    for output_file in [OUTPUT_ANALYSIS_FULL, OUTPUT_ANALYSIS_REPLACED_ONLY, OUTPUT_CLUSTERING]:
         os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
     
     # Запуск обработки
-    analysis, clustering = create_two_files(
+    analysis_full, analysis_replaced, clustering = create_files(
         INPUT_FILE, 
         MODEL_PATH, 
-        OUTPUT_ANALYSIS, 
+        OUTPUT_ANALYSIS_FULL,
+        OUTPUT_ANALYSIS_REPLACED_ONLY,
         OUTPUT_CLUSTERING
     )
     
