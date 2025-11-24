@@ -1,0 +1,177 @@
+index
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Cluster Editor</title>
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        .dialog { border: 1px solid #ccc; padding: 10px; margin: 10px 0; }
+        .user { color: #0066cc; }
+        .assistant { color: #00aa00; }
+        .tag { background: #eee; padding: 2px 6px; margin: 2px; border-radius: 3px; }
+        button { margin: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h1>Cluster Editor</h1>
+    
+    <div>
+        <input type="file" id="fileInput" accept=".json">
+        <button onclick="exportData()">Export JSON</button>
+    </div>
+
+    <div>
+        <h3>Available Tags:</h3>
+        <div id="tagsContainer"></div>
+        <input type="text" id="newTagInput" placeholder="New tag">
+        <button onclick="addNewTag()">Add Tag</button>
+    </div>
+
+    <hr>
+    
+    <div id="dialogsContainer"></div>
+
+    <script src="script.js"></script>
+</body>
+</html>
+
+script js
+
+let originalData = [];
+let clusters = new Map();
+let nextClusterId = 1;
+
+document.getElementById('fileInput').addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    const reader = new FileReader();
+    
+    reader.onload = function(e) {
+        originalData = JSON.parse(e.target.result);
+        processData(originalData);
+        renderDialogs();
+        updateTagsDisplay();
+    };
+    
+    reader.readAsText(file);
+});
+
+function processData(data) {
+    clusters.clear();
+    nextClusterId = 1;
+    
+    data.forEach(item => {
+        if (item.cluster && !clusters.has(item.cluster)) {
+            clusters.set(item.cluster, nextClusterId++);
+        }
+    });
+}
+
+function updateTagsDisplay() {
+    const container = document.getElementById('tagsContainer');
+    container.innerHTML = '';
+    
+    clusters.forEach((id, name) => {
+        const tagElem = document.createElement('span');
+        tagElem.className = 'tag';
+        tagElem.innerHTML = `
+            ${name} (ID: ${id})
+            <button onclick="editTag('${name}')">✏️</button>
+            <button onclick="deleteTag('${name}')">❌</button>
+        `;
+        container.appendChild(tagElem);
+    });
+}
+
+function renderDialogs() {
+    const container = document.getElementById('dialogsContainer');
+    container.innerHTML = '';
+
+    originalData.forEach((dialog, index) => {
+        const dialogElem = document.createElement('div');
+        dialogElem.className = 'dialog';
+        dialogElem.innerHTML = `
+            <h3>Dialog ID: ${dialog.dialog_id}</h3>
+            <select onchange="updateCluster(${index}, this.value)">
+                <option value="">Select Cluster</option>
+                ${Array.from(clusters.entries()).map(([name, id]) => `
+                    <option value="${name}" ${dialog.cluster === name ? 'selected' : ''}>
+                        ${name} (ID: ${id})
+                    </option>
+                `).join('')}
+            </select>
+            <div class="messages">
+                ${dialog.full_dialog.messages.map(msg => `
+                    <div class="${msg.role}">
+                        <strong>${msg.role}:</strong> ${msg.message}
+                    </div>
+                `).join('')}
+            </div>
+        `;
+        container.appendChild(dialogElem);
+    });
+}
+
+function addNewTag() {
+    const input = document.getElementById('newTagInput');
+    const newTag = input.value.trim();
+    
+    if (newTag && !clusters.has(newTag)) {
+        clusters.set(newTag, nextClusterId++);
+        updateTagsDisplay();
+        renderDialogs();
+        input.value = '';
+    }
+}
+
+function editTag(oldName) {
+    const newName = prompt('Enter new tag name:', oldName);
+    if (newName && newName !== oldName) {
+        const id = clusters.get(oldName);
+        clusters.delete(oldName);
+        clusters.set(newName, id);
+        
+        originalData.forEach(dialog => {
+            if (dialog.cluster === oldName) dialog.cluster = newName;
+        });
+        
+        updateTagsDisplay();
+        renderDialogs();
+    }
+}
+
+function deleteTag(name) {
+    if (confirm(`Delete tag "${name}"?`)) {
+        clusters.delete(name);
+        originalData.forEach(dialog => {
+            if (dialog.cluster === name) dialog.cluster = '';
+        });
+        updateTagsDisplay();
+        renderDialogs();
+    }
+}
+
+function updateCluster(dialogIndex, clusterName) {
+    originalData[dialogIndex].cluster = clusterName;
+}
+
+function exportData() {
+    const exportData = originalData.map(dialog => ({
+        ...dialog,
+        cluster_id: clusters.get(dialog.cluster) || 0
+    }));
+
+    const dataStr = JSON.stringify(exportData, null, 2);
+    const blob = new Blob([dataStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'updated_data.json';
+    link.click();
+    
+    URL.revokeObjectURL(url);
+}
+
+
+python -m http.server 8000
