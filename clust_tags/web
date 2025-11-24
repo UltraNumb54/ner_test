@@ -1,16 +1,26 @@
-index
-
 <!DOCTYPE html>
 <html>
 <head>
     <title>Cluster Editor</title>
     <style>
         body { font-family: Arial; margin: 20px; }
-        .dialog { border: 1px solid #ccc; padding: 10px; margin: 10px 0; }
+        .dialog { border: 1px solid #ccc; padding: 10px; margin: 10px 0; position: relative; }
         .user { color: #0066cc; }
         .assistant { color: #00aa00; }
-        .tag { background: #eee; padding: 2px 6px; margin: 2px; border-radius: 3px; }
+        .tag { background: #eee; padding: 2px 6px; margin: 2px; border-radius: 3px; display: inline-block; }
         button { margin: 5px; cursor: pointer; }
+        .pagination { margin: 20px 0; }
+        .delete-btn { 
+            position: absolute; 
+            top: 10px; 
+            right: 10px; 
+            background: #ff4444; 
+            color: white; 
+            border: none; 
+            padding: 5px 10px;
+            cursor: pointer;
+        }
+        .stats { margin: 10px 0; color: #666; }
     </style>
 </head>
 <body>
@@ -19,6 +29,7 @@ index
     <div>
         <input type="file" id="fileInput" accept=".json">
         <button onclick="exportData()">Export JSON</button>
+        <span class="stats" id="stats">Total dialogs: 0</span>
     </div>
 
     <div>
@@ -30,17 +41,38 @@ index
 
     <hr>
     
+    <div class="pagination">
+        <button onclick="changePage(-1)">Previous</button>
+        <span id="pageInfo">Page 1 of 1</span>
+        <button onclick="changePage(1)">Next</button>
+        <select id="pageSize" onchange="changePageSize()">
+            <option value="10">10 per page</option>
+            <option value="20">20 per page</option>
+            <option value="50" selected>50 per page</option>
+            <option value="100">100 per page</option>
+        </select>
+    </div>
+    
     <div id="dialogsContainer"></div>
+
+    <div class="pagination">
+        <button onclick="changePage(-1)">Previous</button>
+        <span id="pageInfoBottom">Page 1 of 1</span>
+        <button onclick="changePage(1)">Next</button>
+    </div>
 
     <script src="script.js"></script>
 </body>
 </html>
 
-script js
 
 let originalData = [];
 let clusters = new Map();
 let nextClusterId = 1;
+
+// Пагинация
+let currentPage = 1;
+let itemsPerPage = 50;
 
 document.getElementById('fileInput').addEventListener('change', function(e) {
     const file = e.target.files[0];
@@ -49,8 +81,10 @@ document.getElementById('fileInput').addEventListener('change', function(e) {
     reader.onload = function(e) {
         originalData = JSON.parse(e.target.result);
         processData(originalData);
+        currentPage = 1;
         renderDialogs();
         updateTagsDisplay();
+        updateStats();
     };
     
     reader.readAsText(file);
@@ -65,6 +99,11 @@ function processData(data) {
             clusters.set(item.cluster, nextClusterId++);
         }
     });
+}
+
+function updateStats() {
+    const statsElem = document.getElementById('stats');
+    statsElem.textContent = `Total dialogs: ${originalData.length}`;
 }
 
 function updateTagsDisplay() {
@@ -87,12 +126,19 @@ function renderDialogs() {
     const container = document.getElementById('dialogsContainer');
     container.innerHTML = '';
 
-    originalData.forEach((dialog, index) => {
+    // Вычисляем диапазон отображаемых записей
+    const startIndex = (currentPage - 1) * itemsPerPage;
+    const endIndex = Math.min(startIndex + itemsPerPage, originalData.length);
+    const currentDialogs = originalData.slice(startIndex, endIndex);
+
+    currentDialogs.forEach((dialog, localIndex) => {
+        const globalIndex = startIndex + localIndex;
         const dialogElem = document.createElement('div');
         dialogElem.className = 'dialog';
         dialogElem.innerHTML = `
+            <button class="delete-btn" onclick="deleteDialog(${globalIndex})">Delete</button>
             <h3>Dialog ID: ${dialog.dialog_id}</h3>
-            <select onchange="updateCluster(${index}, this.value)">
+            <select onchange="updateCluster(${globalIndex}, this.value)">
                 <option value="">Select Cluster</option>
                 ${Array.from(clusters.entries()).map(([name, id]) => `
                     <option value="${name}" ${dialog.cluster === name ? 'selected' : ''}>
@@ -110,6 +156,31 @@ function renderDialogs() {
         `;
         container.appendChild(dialogElem);
     });
+
+    updatePagination();
+}
+
+function updatePagination() {
+    const totalPages = Math.ceil(originalData.length / itemsPerPage);
+    const pageInfo = `Page ${currentPage} of ${totalPages} (${originalData.length} total dialogs)`;
+    document.getElementById('pageInfo').textContent = pageInfo;
+    document.getElementById('pageInfoBottom').textContent = pageInfo;
+}
+
+function changePage(direction) {
+    const totalPages = Math.ceil(originalData.length / itemsPerPage);
+    const newPage = currentPage + direction;
+    
+    if (newPage >= 1 && newPage <= totalPages) {
+        currentPage = newPage;
+        renderDialogs();
+    }
+}
+
+function changePageSize() {
+    itemsPerPage = parseInt(document.getElementById('pageSize').value);
+    currentPage = 1;
+    renderDialogs();
 }
 
 function addNewTag() {
@@ -151,6 +222,14 @@ function deleteTag(name) {
     }
 }
 
+function deleteDialog(index) {
+    if (confirm('Delete this dialog?')) {
+        originalData.splice(index, 1);
+        updateStats();
+        renderDialogs();
+    }
+}
+
 function updateCluster(dialogIndex, clusterName) {
     originalData[dialogIndex].cluster = clusterName;
 }
@@ -172,6 +251,3 @@ function exportData() {
     
     URL.revokeObjectURL(url);
 }
-
-
-python -m http.server 8000
