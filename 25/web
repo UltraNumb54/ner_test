@@ -275,6 +275,14 @@
         .metadata-info div {
             margin: 2px 0;
         }
+
+        .selection-info {
+            background: #e9ecef;
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 4px;
+            border-left: 4px solid #007bff;
+        }
     </style>
 </head>
 <body>
@@ -337,6 +345,14 @@
                 <button class="btn" id="nextBtn">Следующий →</button>
             </div>
 
+            <!-- Блок информации о выборе (всегда отображается) -->
+            <div class="selection-info" id="selectionInfo">
+                <strong>Выбрано токенов:</strong> 0<br>
+                <strong>Текст:</strong> "<span id="selectedText">-</span>"<br>
+                <strong>Последовательные:</strong> <span id="sequentialStatus">-</span>
+                <button class="btn" id="clearSelectionBtn" style="margin-left: 10px; padding: 2px 8px; font-size: 12px; display: none;">Очистить</button>
+            </div>
+
             <div class="tag-buttons" id="tagButtons">
                 <!-- Кнопки тегов будут генерироваться здесь -->
             </div>
@@ -362,11 +378,13 @@
                 this.selectedTokens = [];
                 this.customTags = new Set(['PERSON', 'ORG', 'LOC', 'DATE', 'MONEY', 'PHONE', 'EMAIL']);
                 this.currentFile = null;
+                this.lastSelectedIndex = null; // Для выделения диапазона с Shift
                 
                 this.initializeEventListeners();
                 this.renderTagButtons();
                 this.renderTagsList();
                 this.updateTokenStyles();
+                this.updateSelectionInfo(); // Инициализируем информацию о выборе
             }
 
             initializeEventListeners() {
@@ -412,6 +430,11 @@
                 document.getElementById('editBtn').addEventListener('click', () => this.resetAnnotation());
                 document.getElementById('deleteBtn').addEventListener('click', () => this.deleteRow());
                 document.getElementById('saveBtn').addEventListener('click', () => this.saveChanges());
+
+                // Очистка выбора
+                document.getElementById('clearSelectionBtn').addEventListener('click', () => {
+                    this.clearSelection();
+                });
 
                 // Горячие клавиши
                 document.addEventListener('keydown', (e) => this.handleKeyboardShortcuts(e));
@@ -577,6 +600,7 @@
                 
                 this.displayMetadata(row.metadata);
                 this.displayTokens(row.tokens, row.ner_tags);
+                this.updateSelectionInfo(); // Обновляем информацию о выборе
             }
 
             displayMetadata(metadata) {
@@ -602,24 +626,6 @@
                     return;
                 }
                 
-                // Информация о выбранных токенах
-                if (this.selectedTokens.length > 0) {
-                    const selectionInfo = document.createElement('div');
-                    selectionInfo.className = 'selection-info';
-                    
-                    const selectedText = this.selectedTokens.map(i => tokens[i]).join(' ');
-                    const isSequential = this.isSelectionSequential();
-                    
-                    selectionInfo.innerHTML = `
-                        <strong>Выбрано токенов:</strong> ${this.selectedTokens.length}<br>
-                        <strong>Текст:</strong> "${selectedText}"<br>
-                        <strong>Последовательные:</strong> ${isSequential ? 'Да' : 'Нет'}
-                        <button class="btn" onclick="app.clearSelection()" style="margin-left: 10px; padding: 2px 8px; font-size: 12px;">Очистить</button>
-                    `;
-                    
-                    container.appendChild(selectionInfo);
-                }
-                
                 // Отображение токенов
                 for (let i = 0; i < tokens.length; i++) {
                     const token = tokens[i];
@@ -637,33 +643,86 @@
                     
                     tokenElement.addEventListener('click', (e) => {
                         e.preventDefault();
-                        this.toggleTokenSelection(i);
+                        this.handleTokenClick(i, e.shiftKey);
                     });
                     
                     container.appendChild(tokenElement);
                 }
             }
 
-            toggleTokenSelection(index) {
-                const tokenIndex = this.selectedTokens.indexOf(index);
-                
-                if (tokenIndex === -1) {
-                    this.selectedTokens.push(index);
+            handleTokenClick(index, shiftPressed) {
+                if (shiftPressed && this.lastSelectedIndex !== null) {
+                    // Выделение диапазона с Shift
+                    const start = Math.min(this.lastSelectedIndex, index);
+                    const end = Math.max(this.lastSelectedIndex, index);
+                    
+                    this.selectedTokens = [];
+                    for (let i = start; i <= end; i++) {
+                        this.selectedTokens.push(i);
+                    }
                 } else {
-                    this.selectedTokens.splice(tokenIndex, 1);
+                    // Обычное выделение
+                    const tokenIndex = this.selectedTokens.indexOf(index);
+                    
+                    if (tokenIndex === -1) {
+                        this.selectedTokens.push(index);
+                    } else {
+                        this.selectedTokens.splice(tokenIndex, 1);
+                    }
+                    
+                    this.lastSelectedIndex = index;
                 }
                 
                 this.selectedTokens.sort((a, b) => a - b);
                 this.displayCurrentRow();
             }
 
+            updateSelectionInfo() {
+                const selectionInfo = document.getElementById('selectionInfo');
+                const selectedText = document.getElementById('selectedText');
+                const sequentialStatus = document.getElementById('sequentialStatus');
+                const clearSelectionBtn = document.getElementById('clearSelectionBtn');
+                
+                if (this.selectedTokens.length === 0) {
+                    selectionInfo.innerHTML = `
+                        <strong>Выбрано токенов:</strong> 0<br>
+                        <strong>Текст:</strong> "<span id="selectedText">-</span>"<br>
+                        <strong>Последовательные:</strong> <span id="sequentialStatus">-</span>
+                        <button class="btn" id="clearSelectionBtn" style="margin-left: 10px; padding: 2px 8px; font-size: 12px; display: none;">Очистить</button>
+                    `;
+                    
+                    // Перепривязываем событие для кнопки очистки
+                    document.getElementById('clearSelectionBtn').addEventListener('click', () => {
+                        this.clearSelection();
+                    });
+                } else {
+                    const row = this.dataset[this.currentRowIndex];
+                    const selectedTextContent = this.selectedTokens.map(i => row.tokens[i]).join(' ');
+                    const isSequential = this.isSelectionSequential();
+                    
+                    selectionInfo.innerHTML = `
+                        <strong>Выбрано токенов:</strong> ${this.selectedTokens.length}<br>
+                        <strong>Текст:</strong> "${selectedTextContent}"<br>
+                        <strong>Последовательные:</strong> ${isSequential ? 'Да' : 'Нет'}
+                        <button class="btn" id="clearSelectionBtn" style="margin-left: 10px; padding: 2px 8px; font-size: 12px;">Очистить</button>
+                    `;
+                    
+                    // Перепривязываем событие для кнопки очистки
+                    document.getElementById('clearSelectionBtn').addEventListener('click', () => {
+                        this.clearSelection();
+                    });
+                }
+            }
+
             clearSelection() {
                 this.selectedTokens = [];
+                this.lastSelectedIndex = null;
                 this.displayCurrentRow();
             }
 
             isSelectionSequential() {
                 if (this.selectedTokens.length < 2) return true;
+                
                 return this.selectedTokens.every((tokenIndex, i, arr) => {
                     return i === 0 || tokenIndex === arr[i - 1] + 1;
                 });
@@ -713,6 +772,7 @@
                 
                 this.displayCurrentRow();
                 this.selectedTokens = [];
+                this.lastSelectedIndex = null;
                 this.showStatus(`Токены размечены как ${tag}`, 'success');
             }
 
@@ -761,6 +821,8 @@
             previousRow() {
                 if (this.currentRowIndex > 0) {
                     this.currentRowIndex--;
+                    this.selectedTokens = [];
+                    this.lastSelectedIndex = null;
                     this.displayCurrentRow();
                     this.showStatus(`Переход к записи ${this.currentRowIndex + 1}`, 'success');
                 }
@@ -769,6 +831,8 @@
             nextRow() {
                 if (this.currentRowIndex < this.dataset.length - 1) {
                     this.currentRowIndex++;
+                    this.selectedTokens = [];
+                    this.lastSelectedIndex = null;
                     this.displayCurrentRow();
                     this.showStatus(`Переход к записи ${this.currentRowIndex + 1}`, 'success');
                 }
