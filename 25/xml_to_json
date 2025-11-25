@@ -1,23 +1,8 @@
-# Базовая конвертация
-python xml_to_ner_converter.py data.xml
-
-# Конвертация с указанием выходного файла
-python xml_to_ner_converter.py data.xml -o my_dataset.json
-
-# Конвертация в JSONL формат
-python xml_to_ner_converter.py data.xml -o dataset.jsonl --jsonl
-
-# С увеличенным размером чанков
-python xml_to_ner_converter.py data.xml --max-length 2000
-
-
-# xml_to_ner_converter.py
-import xml.etree.ElementTree as ET
+import xmltodict
 import json
 import re
 import html
 from typing import List, Dict, Any
-import argparse
 import os
 
 class XMLToNERConverter:
@@ -48,29 +33,6 @@ class XMLToNERConverter:
         
         return text
     
-    def extract_text_from_description(self, description_element) -> str:
-        """
-        Извлечение текста из description с учетом CDATA
-        """
-        if description_element is None:
-            return ""
-            
-        text_parts = []
-        
-        # Рекурсивно обходим все дочерние элементы и текстовые узлы
-        for node in description_element.iter():
-            if node.text:
-                text_parts.append(node.text)
-            if node.tail and node.tail.strip():
-                text_parts.append(node.tail)
-        
-        # Если не нашли текста в дочерних элементах, берем напрямую
-        if not text_parts and description_element.text:
-            text_parts.append(description_element.text)
-            
-        text = ' '.join(text_parts)
-        return self.clean_text(text)
-    
     def split_text_into_chunks(self, text: str) -> List[str]:
         """
         Разбивка длинного текста на логические части
@@ -83,7 +45,6 @@ class XMLToNERConverter:
         sentences = re.split(r'(?<=[.!?])\s+', text)
         
         for sentence in sentences:
-            # Если добавление предложения превышает лимит и текущий чанк не пустой
             if len(current_chunk) + len(sentence) > self.max_chunk_length and current_chunk:
                 chunks.append(current_chunk.strip())
                 current_chunk = sentence
@@ -111,31 +72,78 @@ class XMLToNERConverter:
         
         return [token for token in tokens if token.strip()]
     
+    def extract_text_from_description(self, description_element) -> str:
+        """
+        Извлечение текста из description с учетом CDATA
+        """
+        if description_element is None:
+            return ""
+            
+        # xmltodict сохраняет CDATA как обычный текст
+        if isinstance(description_element, dict):
+            # Если description содержит сложную структуру
+            return self.extract_text_from_dict(description_element)
+        elif isinstance(description_element, str):
+            return self.clean_text(description_element)
+        else:
+            return self.clean_text(str(description_element))
+    
+    def extract_text_from_dict(self, data_dict: Dict) -> str:
+        """
+        Рекурсивно извлекает текст из сложных словарных структур
+        """
+        if isinstance(data_dict, str):
+            return data_dict
+        
+        text_parts = []
+        
+        # Рекурсивно обходим словарь
+        for key, value in data_dict.items():
+            if isinstance(value, dict):
+                text_parts.append(self.extract_text_from_dict(value))
+            elif isinstance(value, list):
+                for item in value:
+                    text_parts.append(self.extract_text_from_dict(item))
+            elif value is not None:
+                text_parts.append(str(value))
+        
+        return ' '.join(text_parts)
+    
     def convert_xml_to_json(self, xml_file_path: str, output_file: str = None) -> List[Dict[str, Any]]:
         """
         Основной метод конвертации XML в JSON
         """
         try:
-            tree = ET.parse(xml_file_path)
-            root = tree.getroot()
-        except ET.ParseError as e:
+            # Читаем XML файл
+            with open(xml_file_path, 'r', encoding='utf-8') as file:
+                xml_content = file.read()
+            
+            # Парсим XML в словарь с помощью xmltodict
+            data_dict = xmltodict.parse(xml_content)
+            
+        except Exception as e:
             raise ValueError(f"Ошибка парсинга XML: {e}")
         
         dataset = []
         record_count = 0
         chunk_count = 0
         
-        for record in root.findall('record'):
+        # Обрабатываем структуру данных
+        records = data_dict.get('data', {}).get('record', [])
+        if not isinstance(records, list):
+            records = [records]
+        
+        for record in records:
             record_count += 1
             
             # Извлекаем базовые поля
-            record_id = record.findtext('id', '').strip()
-            service = record.findtext('service', '').strip()
-            topic = record.findtext('topic', '').strip()
+            record_id = record.get('id', '')
+            service = record.get('service', '')
+            topic = record.get('topic', '')
             
-            # Извлекаем и очищаем текст описания
-            description_element = record.find('description')
-            original_text = self.extract_text_from_description(description_element)
+            # Обрабатываем description
+            description_content = record.get('description', '')
+            original_text = self.extract_text_from_description(description_content)
             
             if not original_text:
                 print(f"Предупреждение: запись {record_id} не содержит текста")
@@ -143,6 +151,11 @@ class XMLToNERConverter:
             
             # Разбиваем текст на части если нужно
             text_chunks = self.split_text_into_chunks(original_text)
+            
+            # Обрабатываем attachments
+            attachments = record.get('attachments', [])
+            if not isinstance(attachments, list):
+                attachments = [attachments] if attachments else []
             
             for chunk_index, chunk_text in enumerate(text_chunks):
                 chunk_count += 1
@@ -158,10 +171,10 @@ class XMLToNERConverter:
                     "ner_tags": ["O"] * len(tokens),
                     "success": False,
                     "metadata": {
-                        "original_id": record_id,
-                        "service": self.clean_text(service),
-                        "topic": self.clean_text(topic),
-                        "attachments_count": len(record.findall('attachments')),
+                        "original_id": str(record_id),
+                        "service": self.clean_text(str(service)),
+                        "topic": self.clean_text(str(topic)),
+                        "attachments_count": len(attachments),
                         "chunk_index": chunk_index,
                         "total_chunks": len(text_chunks)
                     }
@@ -196,34 +209,35 @@ class XMLToNERConverter:
                 json.dump(item, f, ensure_ascii=False)
                 f.write('\n')
 
-def main():
-    parser = argparse.ArgumentParser(description='Конвертер XML в NER JSON формат')
-    parser.add_argument('input', help='Путь к входному XML файлу')
-    parser.add_argument('-o', '--output', help='Путь к выходному JSON файлу', default='ner_dataset.json')
-    parser.add_argument('--max-length', type=int, default=1000, help='Максимальная длина текстового чанка')
-    parser.add_argument('--jsonl', action='store_true', help='Сохранить в JSONL формат')
+# ПРЯМОЕ УКАЗАНИЕ ПУТЕЙ В КОДЕ
+if __name__ == "__main__":
+    # УКАЖИТЕ ПУТИ К ФАЙЛАМ ЗДЕСЬ
+    INPUT_XML_FILE = "data.xml"  # Путь к вашему XML файлу
+    OUTPUT_JSON_FILE = "ner_dataset.json"  # Путь для сохранения JSON
     
-    args = parser.parse_args()
+    # Параметры конвертации
+    MAX_CHUNK_LENGTH = 1000  # Максимальная длина текстового чанка
+    USE_JSONL_FORMAT = False  # Использовать JSONL формат вместо JSON
     
-    if not os.path.exists(args.input):
-        print(f"Ошибка: файл {args.input} не найден")
-        return
+    # Проверяем существование входного файла
+    if not os.path.exists(INPUT_XML_FILE):
+        print(f"Ошибка: файл {INPUT_XML_FILE} не найден!")
+        print("Убедитесь, что файл существует в указанной директории.")
+        exit(1)
     
-    converter = XMLToNERConverter(max_chunk_length=args.max_length)
+    # Создаем конвертер и выполняем конвертацию
+    converter = XMLToNERConverter(max_chunk_length=MAX_CHUNK_LENGTH)
     
     try:
-        dataset = converter.convert_xml_to_json(args.input, None)
+        dataset = converter.convert_xml_to_json(INPUT_XML_FILE, None)
         
-        if args.jsonl:
-            output_file = args.output.replace('.json', '.jsonl') if args.output.endswith('.json') else args.output + '.jsonl'
+        if USE_JSONL_FORMAT:
+            output_file = OUTPUT_JSON_FILE.replace('.json', '.jsonl') if OUTPUT_JSON_FILE.endswith('.json') else OUTPUT_JSON_FILE + '.jsonl'
             converter.save_to_jsonl(dataset, output_file)
         else:
-            converter.save_to_json(dataset, args.output)
+            converter.save_to_json(dataset, OUTPUT_JSON_FILE)
             
         print("Конвертация завершена успешно!")
         
     except Exception as e:
         print(f"Ошибка при конвертации: {e}")
-
-if __name__ == "__main__":
-    main()
