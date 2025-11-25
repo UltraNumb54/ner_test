@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NER Разметка - Редактор текста и тегов</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f5f5f5;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 10px;
+        }
+
+        .section {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        .btn {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 10px;
+            margin-bottom: 10px;
+            transition: background 0.3s;
+        }
+
+        .btn:hover {
+            background: #2980b9;
+        }
+
+        .btn-success {
+            background: #27ae60;
+        }
+
+        .btn-success:hover {
+            background: #219a52;
+        }
+
+        .btn-danger {
+            background: #e74c3c;
+        }
+
+        .btn-danger:hover {
+            background: #c0392b;
+        }
+
+        .btn-warning {
+            background: #f39c12;
+        }
+
+        .btn-warning:hover {
+            background: #d35400;
+        }
+
+        .tags-management {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
+        }
+
+        .tags-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 10px 0;
+        }
+
+        .tag-item {
+            background: #e3f2fd;
+            padding: 5px 10px;
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .tag-remove {
+            background: none;
+            border: none;
+            color: #666;
+            cursor: pointer;
+            font-size: 16px;
+            padding: 0;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .tag-remove:hover {
+            background: #ff4444;
+            color: white;
+        }
+
+        .tag-input {
+            display: flex;
+            gap: 10px;
+            margin: 10px 0;
+        }
+
+        .tag-input input {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            flex: 1;
+        }
+
+        .tokens-container {
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 15px;
+            min-height: 100px;
+            margin: 15px 0;
+            background: white;
+        }
+
+        .token {
+            display: inline-block;
+            border: 1px solid #ddd;
+            padding: 5px 10px;
+            margin: 2px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+            user-select: none;
+        }
+
+        .token:hover {
+            background-color: #f8f9fa;
+            transform: translateY(-1px);
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .token.selected {
+            background-color: #007bff;
+            color: white;
+            border-color: #0056b3;
+        }
+
+        .tag-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin: 15px 0;
+        }
+
+        .tag-btn {
+            background: #6c757d;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.3s;
+        }
+
+        .tag-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+        }
+
+        .row-info {
+            background: #e9ecef;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+
+        .row-info div {
+            margin: 5px 0;
+        }
+
+        .navigation {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 20px 0;
+        }
+
+        .status-message {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            border: 1px solid;
+            display: none;
+        }
+
+        .status-message.success {
+            background-color: #d4edda;
+            color: #155724;
+            border-color: #c3e6cb;
+        }
+
+        .status-message.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border-color: #f5c6cb;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+            flex-wrap: wrap;
+        }
+
+        .text-editor {
+            margin: 15px 0;
+        }
+
+        .text-editor textarea {
+            width: 100%;
+            height: 150px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-family: inherit;
+            font-size: 14px;
+            resize: vertical;
+        }
+
+        .text-editor-buttons {
+            margin-top: 10px;
+            display: flex;
+            gap: 10px;
+        }
+
+        .metadata-info {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-size: 14px;
+        }
+
+        .metadata-info div {
+            margin: 2px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>NER Разметка - Редактор текста и тегов</h1>
+            <p>Загрузите JSON файл, сгенерированный Python конвертером</p>
+        </header>
+
+        <!-- Секция управления тегами -->
+        <section class="section">
+            <h2>Управление тегами NER</h2>
+            
+            <div class="tags-management">
+                <h3>Доступные теги</h3>
+                <div class="tag-input">
+                    <input type="text" id="newTagInput" placeholder="Введите новый тег (например: PERSON, ORG, LOC...)">
+                    <button class="btn" id="addTagBtn">Добавить тег</button>
+                </div>
+                <div class="tags-list" id="tagsList">
+                    <!-- Теги будут добавляться сюда -->
+                </div>
+            </div>
+
+            <div class="file-upload">
+                <input type="file" id="jsonFile" accept=".json,.jsonl" style="display: none;">
+                <button class="btn" id="loadJsonBtn">Загрузить JSON для разметки</button>
+                <button class="btn btn-success" id="exportBtn">Экспортировать JSON</button>
+            </div>
+
+            <div id="taggerStatus" class="status-message"></div>
+        </section>
+
+        <!-- Секция разметки -->
+        <section class="section" id="annotationSection" style="display: none;">
+            <h2>Разметка текста</h2>
+            
+            <div class="row-info">
+                <div><strong>ID:</strong> <span id="dialogId">-</span></div>
+                <div><strong>Статус:</strong> <span id="successStatus">Не размечено</span></div>
+            </div>
+
+            <div class="metadata-info" id="metadataInfo">
+                <!-- Метаданные будут здесь -->
+            </div>
+
+            <!-- Редактор текста -->
+            <div class="text-editor">
+                <h3>Исходный текст</h3>
+                <textarea id="textEditor" placeholder="Здесь отображается исходный текст..."></textarea>
+                <div class="text-editor-buttons">
+                    <button class="btn btn-warning" id="updateTextBtn">Обновить текст</button>
+                    <button class="btn" id="retokenizeBtn">Переразметить токены</button>
+                </div>
+            </div>
+
+            <div class="navigation">
+                <button class="btn" id="prevBtn">← Предыдущий</button>
+                <span id="currentIndex">0/0</span>
+                <button class="btn" id="nextBtn">Следующий →</button>
+            </div>
+
+            <div class="tag-buttons" id="tagButtons">
+                <!-- Кнопки тегов будут генерироваться здесь -->
+            </div>
+
+            <div class="tokens-container" id="tokensContainer">
+                <!-- Токены будут отображаться здесь -->
+            </div>
+
+            <div class="action-buttons">
+                <button class="btn" id="editBtn">Сбросить разметку</button>
+                <button class="btn btn-danger" id="deleteBtn">Удалить строку</button>
+                <button class="btn btn-success" id="saveBtn">Сохранить изменения</button>
+            </div>
+        </section>
+    </div>
+
+    <script>
+        // Основной код приложения с редактированием текста
+        class NERAnnotationApp {
+            constructor() {
+                this.dataset = [];
+                this.currentRowIndex = 0;
+                this.selectedTokens = [];
+                this.customTags = new Set(['PERSON', 'ORG', 'LOC', 'DATE', 'MONEY', 'PHONE', 'EMAIL']);
+                this.currentFile = null;
+                
+                this.initializeEventListeners();
+                this.renderTagButtons();
+                this.renderTagsList();
+                this.updateTokenStyles();
+            }
+
+            initializeEventListeners() {
+                // Управление тегами
+                document.getElementById('addTagBtn').addEventListener('click', () => {
+                    this.addCustomTag();
+                });
+
+                document.getElementById('newTagInput').addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') {
+                        this.addCustomTag();
+                    }
+                });
+
+                // Загрузка JSON
+                document.getElementById('loadJsonBtn').addEventListener('click', () => {
+                    document.getElementById('jsonFile').click();
+                });
+
+                document.getElementById('jsonFile').addEventListener('change', (e) => {
+                    this.loadJSONFile(e.target.files[0]);
+                });
+
+                // Экспорт
+                document.getElementById('exportBtn').addEventListener('click', () => {
+                    this.exportDataset();
+                });
+
+                // Редактирование текста
+                document.getElementById('updateTextBtn').addEventListener('click', () => {
+                    this.updateText();
+                });
+
+                document.getElementById('retokenizeBtn').addEventListener('click', () => {
+                    this.retokenizeText();
+                });
+
+                // Навигация
+                document.getElementById('prevBtn').addEventListener('click', () => this.previousRow());
+                document.getElementById('nextBtn').addEventListener('click', () => this.nextRow());
+
+                // Действия
+                document.getElementById('editBtn').addEventListener('click', () => this.resetAnnotation());
+                document.getElementById('deleteBtn').addEventListener('click', () => this.deleteRow());
+                document.getElementById('saveBtn').addEventListener('click', () => this.saveChanges());
+
+                // Горячие клавиши
+                document.addEventListener('keydown', (e) => this.handleKeyboardShortcuts(e));
+            }
+
+            addCustomTag() {
+                const input = document.getElementById('newTagInput');
+                const tag = input.value.trim().toUpperCase();
+                
+                if (tag && !this.customTags.has(tag)) {
+                    this.customTags.add(tag);
+                    this.renderTagButtons();
+                    this.renderTagsList();
+                    this.updateTokenStyles();
+                    input.value = '';
+                    this.showStatus(`Тег "${tag}" добавлен`, 'success');
+                } else if (this.customTags.has(tag)) {
+                    this.showStatus(`Тег "${tag}" уже существует`, 'error');
+                }
+            }
+
+            removeCustomTag(tag) {
+                this.customTags.delete(tag);
+                this.renderTagButtons();
+                this.renderTagsList();
+                this.updateTokenStyles();
+                this.showStatus(`Тег "${tag}" удален`, 'success');
+            }
+
+            renderTagButtons() {
+                const container = document.getElementById('tagButtons');
+                container.innerHTML = '';
+                
+                // Добавляем кнопку для тега O
+                const oButton = document.createElement('button');
+                oButton.className = 'tag-btn';
+                oButton.style.backgroundColor = '#6c757d';
+                oButton.textContent = 'O (Сброс)';
+                oButton.dataset.tag = 'O';
+                oButton.addEventListener('click', () => this.assignTagToSelection('O'));
+                container.appendChild(oButton);
+
+                // Добавляем кнопки для кастомных тегов
+                Array.from(this.customTags).forEach(tag => {
+                    const button = document.createElement('button');
+                    button.className = 'tag-btn';
+                    button.style.backgroundColor = this.getTagColor(tag);
+                    button.textContent = tag;
+                    button.dataset.tag = tag;
+                    button.addEventListener('click', () => this.assignTagToSelection(tag));
+                    container.appendChild(button);
+                });
+            }
+
+            renderTagsList() {
+                const container = document.getElementById('tagsList');
+                container.innerHTML = '';
+                
+                Array.from(this.customTags).forEach(tag => {
+                    const tagElement = document.createElement('div');
+                    tagElement.className = 'tag-item';
+                    tagElement.innerHTML = `
+                        ${tag}
+                        <button class="tag-remove" onclick="app.removeCustomTag('${tag}')">×</button>
+                    `;
+                    container.appendChild(tagElement);
+                });
+            }
+
+            getTagColor(tag) {
+                const colors = [
+                    '#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#feca57',
+                    '#ff9ff3', '#54a0ff', '#5f27cd', '#00d2d3', '#ff9f43',
+                    '#ff7979', '#badc58', '#7ed6df', '#e056fd', '#f9ca24'
+                ];
+                let hash = 0;
+                for (let i = 0; i < tag.length; i++) {
+                    hash = tag.charCodeAt(i) + ((hash << 5) - hash);
+                }
+                return colors[Math.abs(hash) % colors.length];
+            }
+
+            updateTokenStyles() {
+                const styleId = 'dynamic-token-styles';
+                let existingStyle = document.getElementById(styleId);
+                if (existingStyle) {
+                    existingStyle.remove();
+                }
+                
+                const style = document.createElement('style');
+                style.id = styleId;
+                let css = '';
+                
+                // Базовый стиль для O
+                css += `.token-O { background-color: #f8f9fa; color: #333; border-color: #ddd; }`;
+                
+                Array.from(this.customTags).forEach(tag => {
+                    const color = this.getTagColor(tag);
+                    css += `
+                        .token-B-${tag} { 
+                            background-color: ${color}; 
+                            color: white; 
+                            border-color: ${color};
+                            font-weight: bold;
+                        }
+                        .token-I-${tag} { 
+                            background-color: ${this.lightenColor(color, 40)}; 
+                            color: #333; 
+                            border-color: ${color};
+                        }
+                    `;
+                });
+                
+                style.textContent = css;
+                document.head.appendChild(style);
+            }
+
+            lightenColor(color, percent) {
+                const num = parseInt(color.replace("#", ""), 16);
+                const amt = Math.round(2.55 * percent);
+                const R = Math.min(255, (num >> 16) + amt);
+                const G = Math.min(255, (num >> 8 & 0x00FF) + amt);
+                const B = Math.min(255, (num & 0x0000FF) + amt);
+                return "#" + ((1 << 24) + (R << 16) + (G << 8) + B).toString(16).slice(1);
+            }
+
+            async loadJSONFile(file) {
+                try {
+                    const text = await this.readFileAsText(file);
+                    this.dataset = JSON.parse(text);
+                    this.currentRowIndex = 0;
+                    this.currentFile = file;
+                    this.showAnnotationSection();
+                    this.displayCurrentRow();
+                    this.showStatus(`Загружено ${this.dataset.length} записей`, 'success');
+                } catch (error) {
+                    this.showStatus(`Ошибка загрузки JSON: ${error.message}`, 'error');
+                }
+            }
+
+            readFileAsText(file) {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = e => resolve(e.target.result);
+                    reader.onerror = reject;
+                    reader.readAsText(file);
+                });
+            }
+
+            showAnnotationSection() {
+                document.getElementById('annotationSection').style.display = 'block';
+            }
+
+            displayCurrentRow() {
+                if (this.dataset.length === 0) return;
+                
+                const row = this.dataset[this.currentRowIndex];
+                
+                document.getElementById('dialogId').textContent = row.id;
+                document.getElementById('successStatus').textContent = row.success ? 'Размечено' : 'Не размечено';
+                document.getElementById('currentIndex').textContent = `${this.currentRowIndex + 1}/${this.dataset.length}`;
+                document.getElementById('textEditor').value = row.original_text;
+                
+                this.displayMetadata(row.metadata);
+                this.displayTokens(row.tokens, row.ner_tags);
+            }
+
+            displayMetadata(metadata) {
+                const container = document.getElementById('metadataInfo');
+                if (!metadata) {
+                    container.innerHTML = '';
+                    return;
+                }
+                
+                let html = '<div><strong>Метаданные:</strong></div>';
+                for (const [key, value] of Object.entries(metadata)) {
+                    html += `<div><strong>${key}:</strong> ${value}</div>`;
+                }
+                container.innerHTML = html;
+            }
+
+            displayTokens(tokens, tags) {
+                const container = document.getElementById('tokensContainer');
+                container.innerHTML = '';
+                
+                if (!tokens || !tags || tokens.length !== tags.length) {
+                    container.innerHTML = '<p>Ошибка: некорректные данные токенов</p>';
+                    return;
+                }
+                
+                // Информация о выбранных токенах
+                if (this.selectedTokens.length > 0) {
+                    const selectionInfo = document.createElement('div');
+                    selectionInfo.className = 'selection-info';
+                    
+                    const selectedText = this.selectedTokens.map(i => tokens[i]).join(' ');
+                    const isSequential = this.isSelectionSequential();
+                    
+                    selectionInfo.innerHTML = `
+                        <strong>Выбрано токенов:</strong> ${this.selectedTokens.length}<br>
+                        <strong>Текст:</strong> "${selectedText}"<br>
+                        <strong>Последовательные:</strong> ${isSequential ? 'Да' : 'Нет'}
+                        <button class="btn" onclick="app.clearSelection()" style="margin-left: 10px; padding: 2px 8px; font-size: 12px;">Очистить</button>
+                    `;
+                    
+                    container.appendChild(selectionInfo);
+                }
+                
+                // Отображение токенов
+                for (let i = 0; i < tokens.length; i++) {
+                    const token = tokens[i];
+                    const tag = tags[i];
+                    
+                    const tokenElement = document.createElement('div');
+                    tokenElement.className = `token token-${tag}`;
+                    tokenElement.textContent = token;
+                    tokenElement.dataset.index = i;
+                    tokenElement.title = `Токен: ${token}\nМетка: ${tag}`;
+                    
+                    if (this.selectedTokens.includes(i)) {
+                        tokenElement.classList.add('selected');
+                    }
+                    
+                    tokenElement.addEventListener('click', (e) => {
+                        e.preventDefault();
+                        this.toggleTokenSelection(i);
+                    });
+                    
+                    container.appendChild(tokenElement);
+                }
+            }
+
+            toggleTokenSelection(index) {
+                const tokenIndex = this.selectedTokens.indexOf(index);
+                
+                if (tokenIndex === -1) {
+                    this.selectedTokens.push(index);
+                } else {
+                    this.selectedTokens.splice(tokenIndex, 1);
+                }
+                
+                this.selectedTokens.sort((a, b) => a - b);
+                this.displayCurrentRow();
+            }
+
+            clearSelection() {
+                this.selectedTokens = [];
+                this.displayCurrentRow();
+            }
+
+            isSelectionSequential() {
+                if (this.selectedTokens.length < 2) return true;
+                return this.selectedTokens.every((tokenIndex, i, arr) => {
+                    return i === 0 || tokenIndex === arr[i - 1] + 1;
+                });
+            }
+
+            assignTagToSelection(tag) {
+                if (this.dataset.length === 0) {
+                    this.showStatus('Сначала загрузите данные', 'error');
+                    return;
+                }
+                
+                if (this.selectedTokens.length === 0) {
+                    this.showStatus('Выберите хотя бы один токен', 'error');
+                    return;
+                }
+                
+                const row = this.dataset[this.currentRowIndex];
+                const tokens = row.tokens;
+                const nerTags = row.ner_tags;
+                
+                // Помечаем как размеченное
+                row.success = true;
+                document.getElementById('successStatus').textContent = 'Размечено';
+                
+                this.selectedTokens.sort((a, b) => a - b);
+                
+                if (tag === 'O') {
+                    // Сброс тегов
+                    this.selectedTokens.forEach(index => {
+                        nerTags[index] = 'O';
+                    });
+                } else {
+                    // Умная разметка B- и I- префиксами
+                    const firstSelected = this.selectedTokens[0];
+                    const prevTag = firstSelected > 0 ? nerTags[firstSelected - 1] : null;
+                    
+                    const isContinuation = prevTag && prevTag === `I-${tag}`;
+                    
+                    this.selectedTokens.forEach((index, i) => {
+                        if (i === 0 && !isContinuation) {
+                            nerTags[index] = `B-${tag}`;
+                        } else {
+                            nerTags[index] = `I-${tag}`;
+                        }
+                    });
+                }
+                
+                this.displayCurrentRow();
+                this.selectedTokens = [];
+                this.showStatus(`Токены размечены как ${tag}`, 'success');
+            }
+
+            // Обновление текста
+            updateText() {
+                if (this.dataset.length === 0) return;
+                
+                const newText = document.getElementById('textEditor').value.trim();
+                if (!newText) {
+                    this.showStatus('Текст не может быть пустым', 'error');
+                    return;
+                }
+                
+                const row = this.dataset[this.currentRowIndex];
+                row.original_text = newText;
+                row.tokens = this.tokenizeText(newText);
+                row.ner_tags = Array(row.tokens.length).fill('O');
+                row.success = false;
+                
+                this.displayCurrentRow();
+                this.showStatus('Текст обновлен, разметка сброшена', 'success');
+            }
+
+            // Переразметка токенов
+            retokenizeText() {
+                if (this.dataset.length === 0) return;
+                
+                const row = this.dataset[this.currentRowIndex];
+                const currentText = row.original_text;
+                row.tokens = this.tokenizeText(currentText);
+                row.ner_tags = Array(row.tokens.length).fill('O');
+                row.success = false;
+                
+                this.displayCurrentRow();
+                this.showStatus('Токены переразмечены', 'success');
+            }
+
+            // Токенизация текста (аналогичная Python конвертеру)
+            tokenizeText(text) {
+                if (!text) return [];
+                const tokenRegex = /[\w\u0400-\u04FF@]+|[^\w\s]|_+/g;
+                const tokens = text.match(tokenRegex) || [];
+                return tokens.filter(token => token.trim() !== '');
+            }
+
+            previousRow() {
+                if (this.currentRowIndex > 0) {
+                    this.currentRowIndex--;
+                    this.displayCurrentRow();
+                    this.showStatus(`Переход к записи ${this.currentRowIndex + 1}`, 'success');
+                }
+            }
+
+            nextRow() {
+                if (this.currentRowIndex < this.dataset.length - 1) {
+                    this.currentRowIndex++;
+                    this.displayCurrentRow();
+                    this.showStatus(`Переход к записи ${this.currentRowIndex + 1}`, 'success');
+                }
+            }
+
+            resetAnnotation() {
+                if (this.dataset.length === 0) return;
+                
+                if (confirm('Вы уверены, что хотите сбросить разметку для этой записи?')) {
+                    const row = this.dataset[this.currentRowIndex];
+                    row.ner_tags = Array(row.tokens.length).fill('O');
+                    row.success = false;
+                    this.displayCurrentRow();
+                    this.showStatus('Разметка сброшена', 'success');
+                }
+            }
+
+            deleteRow() {
+                if (this.dataset.length === 0) return;
+                
+                if (confirm('Вы уверены, что хотите удалить эту запись?')) {
+                    this.dataset.splice(this.currentRowIndex, 1);
+                    
+                    if (this.dataset.length === 0) {
+                        this.hideAnnotationSection();
+                        this.showStatus('Все записи удалены', 'success');
+                        return;
+                    }
+                    
+                    if (this.currentRowIndex >= this.dataset.length) {
+                        this.currentRowIndex = this.dataset.length - 1;
+                    }
+                    
+                    this.displayCurrentRow();
+                    this.showStatus('Запись удалена', 'success');
+                }
+            }
+
+            hideAnnotationSection() {
+                document.getElementById('annotationSection').style.display = 'none';
+            }
+
+            saveChanges() {
+                this.showStatus('Изменения сохранены в памяти', 'success');
+            }
+
+            exportDataset() {
+                if (this.dataset.length === 0) {
+                    this.showStatus('Нет данных для экспорта', 'error');
+                    return;
+                }
+                
+                const jsonData = JSON.stringify(this.dataset, null, 2);
+                const blob = new Blob([jsonData], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = this.currentFile ? `annotated_${this.currentFile.name}` : 'annotated_ner_dataset.json';
+                link.click();
+                URL.revokeObjectURL(url);
+                
+                this.showStatus('Датасет экспортирован', 'success');
+            }
+
+            handleKeyboardShortcuts(e) {
+                if (e.ctrlKey) {
+                    switch(e.key) {
+                        case 'ArrowLeft':
+                            e.preventDefault();
+                            this.previousRow();
+                            break;
+                        case 'ArrowRight':
+                            e.preventDefault();
+                            this.nextRow();
+                            break;
+                    }
+                }
+                
+                if (e.key === 'Escape') {
+                    this.clearSelection();
+                }
+            }
+
+            showStatus(message, type) {
+                const statusElement = document.getElementById('taggerStatus');
+                statusElement.textContent = message;
+                statusElement.className = `status-message ${type}`;
+                statusElement.style.display = 'block';
+                
+                setTimeout(() => {
+                    statusElement.style.display = 'none';
+                }, 5000);
+            }
+        }
+
+        // Инициализация приложения
+        const app = new NERAnnotationApp();
+    </script>
+</body>
+</html>
