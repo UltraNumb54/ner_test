@@ -1,3 +1,16 @@
+# Базовая конвертация
+python xml_to_ner_converter.py data.xml
+
+# Конвертация с указанием выходного файла
+python xml_to_ner_converter.py data.xml -o my_dataset.json
+
+# Конвертация в JSONL формат
+python xml_to_ner_converter.py data.xml -o dataset.jsonl --jsonl
+
+# С увеличенным размером чанков
+python xml_to_ner_converter.py data.xml --max-length 2000
+
+
 # xml_to_ner_converter.py
 import xml.etree.ElementTree as ET
 import json
