@@ -1,0 +1,387 @@
+import xmltodict
+import json
+import re
+import html
+from typing import List, Dict, Any, Optional
+import os
+import glob
+from collections import defaultdict
+
+class XMLToNERConverter:
+    def __init__(self, max_chunk_length: int = 1000):
+        self.max_chunk_length = max_chunk_length
+        
+    def clean_text(self, text: str) -> str:
+        """
+        Очистка текста от проблемных символов и нормализация
+        """
+        if not text:
+            return ""
+            
+        # Декодируем HTML entities
+        text = html.unescape(text)
+        
+        # Заменяем проблемные кавычки
+        text = text.replace('"', "'")
+        
+        # Удаляем управляющие символы и непечатаемые символы
+        text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+        
+        # Заменяем множественные пробелы и переносы
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Удаляем начальные и конечные пробелы
+        text = text.strip()
+        
+        return text
+    
+    def split_text_into_chunks(self, text: str) -> List[str]:
+        """
+        Разбивка длинного текста на логические части
+        """
+        if len(text) <= self.max_chunk_length:
+            return [text]
+        
+        chunks = []
+        current_chunk = ""
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        for sentence in sentences:
+            if len(current_chunk) + len(sentence) > self.max_chunk_length and current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = sentence
+            else:
+                if current_chunk:
+                    current_chunk += " " + sentence
+                else:
+                    current_chunk = sentence
+        
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+            
+        return chunks
+    
+    def tokenize_text(self, text: str) -> List[str]:
+        """
+        Токенизация текста для русского языка
+        """
+        if not text:
+            return []
+        
+        # Улучшенная токенизация для русского языка
+        token_regex = r'[\w\u0400-\u04FF@]+|[^\w\s]|_+'
+        tokens = re.findall(token_regex, text)
+        
+        return [token for token in tokens if token.strip()]
+    
+    def extract_text_from_description(self, description_element) -> str:
+        """
+        Извлечение текста из description с учетом CDATA
+        """
+        if description_element is None:
+            return ""
+            
+        # xmltodict сохраняет CDATA как обычный текст
+        if isinstance(description_element, dict):
+            # Если description содержит сложную структуру
+            return self.extract_text_from_dict(description_element)
+        elif isinstance(description_element, str):
+            return self.clean_text(description_element)
+        else:
+            return self.clean_text(str(description_element))
+    
+    def extract_text_from_dict(self, data_dict: Dict) -> str:
+        """
+        Рекурсивно извлекает текст из сложных словарных структур
+        """
+        if isinstance(data_dict, str):
+            return data_dict
+        
+        text_parts = []
+        
+        # Рекурсивно обходим словарь
+        for key, value in data_dict.items():
+            if isinstance(value, dict):
+                text_parts.append(self.extract_text_from_dict(value))
+            elif isinstance(value, list):
+                for item in value:
+                    text_parts.append(self.extract_text_from_dict(item))
+            elif value is not None:
+                text_parts.append(str(value))
+        
+        return ' '.join(text_parts)
+    
+    def convert_xml_to_json_by_service(
+        self, 
+        xml_file_path: str, 
+        output_dir: str = "output",
+        limit_per_service: Optional[int] = None,
+        take_from_end: bool = True
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Конвертация XML в JSON с группировкой по service
+        """
+        try:
+            # Читаем XML файл
+            with open(xml_file_path, 'r', encoding='utf-8') as file:
+                xml_content = file.read()
+            
+            # Парсим XML в словарь с помощью xmltodict
+            data_dict = xmltodict.parse(xml_content)
+            
+        except Exception as e:
+            raise ValueError(f"Ошибка парсинга XML: {e}")
+        
+        # Создаем выходную директорию если не существует
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Группируем записи по service
+        service_groups = defaultdict(list)
+        record_count = 0
+        chunk_count = 0
+        
+        # Обрабатываем структуру данных
+        records = data_dict.get('data', {}).get('record', [])
+        if not isinstance(records, list):
+            records = [records]
+        
+        for record in records:
+            record_count += 1
+            
+            # Извлекаем базовые поля
+            record_id = record.get('id', '')
+            service = record.get('service', 'Без_категории')
+            topic = record.get('topic', '')
+            
+            # Обрабатываем description
+            description_content = record.get('description', '')
+            original_text = self.extract_text_from_description(description_content)
+            
+            if not original_text:
+                print(f"Предупреждение: запись {record_id} не содержит текста")
+                continue
+            
+            # Разбиваем текст на части если нужно
+            text_chunks = self.split_text_into_chunks(original_text)
+            
+            # Обрабатываем attachments
+            attachments = record.get('attachments', [])
+            if not isinstance(attachments, list):
+                attachments = [attachments] if attachments else []
+            
+            for chunk_index, chunk_text in enumerate(text_chunks):
+                chunk_count += 1
+                
+                # Токенизируем текст
+                tokens = self.tokenize_text(chunk_text)
+                
+                # Создаем запись для датасета
+                dataset_entry = {
+                    "id": f"{record_id}_{chunk_index}",
+                    "original_text": chunk_text,
+                    "tokens": tokens,
+                    "ner_tags": ["O"] * len(tokens),
+                    "success": False,
+                    "metadata": {
+                        "original_id": str(record_id),
+                        "service": self.clean_text(str(service)),
+                        "topic": self.clean_text(str(topic)),
+                        "attachments_count": len(attachments),
+                        "chunk_index": chunk_index,
+                        "total_chunks": len(text_chunks)
+                    }
+                }
+                
+                # Добавляем в соответствующую группу
+                service_groups[service].append(dataset_entry)
+        
+        print(f"Обработано записей: {record_count}")
+        print(f"Создано чанков: {chunk_count}")
+        print(f"Найдено сервисов: {len(service_groups)}")
+        
+        # Сохраняем каждую группу в отдельный файл
+        saved_files = []
+        for service, records in service_groups.items():
+            # Обрабатываем ограничение количества записей
+            if limit_per_service and len(records) > limit_per_service:
+                if take_from_end:
+                    # Берем последние N записей
+                    records = records[-limit_per_service:]
+                    print(f"Для сервиса '{service}' взято последних {limit_per_service} записей из {len(service_groups[service])}")
+                else:
+                    # Берем первые N записей
+                    records = records[:limit_per_service]
+                    print(f"Для сервиса '{service}' взято первых {limit_per_service} записей из {len(service_groups[service])}")
+            
+            # Создаем безопасное имя файла
+            safe_service_name = self.create_safe_filename(service)
+            output_file = os.path.join(output_dir, f"ner_dataset_{safe_service_name}.json")
+            
+            # Сохраняем в файл
+            self.save_to_json(records, output_file)
+            saved_files.append(output_file)
+            print(f"Создан файл: {output_file} ({len(records)} записей)")
+        
+        # Создаем файл с информацией о всех сервисах
+        summary = {
+            "total_services": len(service_groups),
+            "total_records": sum(len(records) for records in service_groups.values()),
+            "services": {
+                service: len(records) for service, records in service_groups.items()
+            },
+            "generated_files": saved_files
+        }
+        
+        summary_file = os.path.join(output_dir, "conversion_summary.json")
+        self.save_to_json(summary, summary_file)
+        print(f"Создан файл с общей информацией: {summary_file}")
+        
+        return service_groups
+    
+    def create_safe_filename(self, name: str) -> str:
+        """
+        Создает безопасное имя файла из строки
+        """
+        # Заменяем проблемные символы
+        safe_name = re.sub(r'[<>:"/\\|?*]', '_', name)
+        # Убираем лишние пробелы и ограничиваем длину
+        safe_name = re.sub(r'\s+', '_', safe_name.strip())
+        # Ограничиваем длину имени файла
+        return safe_name[:100]
+    
+    def save_to_json(self, dataset: List[Dict], output_file: str):
+        """
+        Сохранение датасета в JSON файл
+        """
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(dataset, f, ensure_ascii=False, indent=2)
+    
+    def save_to_jsonl(self, dataset: List[Dict], output_file: str):
+        """
+        Сохранение датасета в JSONL формат (одна строка - один JSON)
+        """
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for item in dataset:
+                json.dump(item, f, ensure_ascii=False)
+                f.write('\n')
+    
+    def merge_json_files(
+        self, 
+        input_dir: str, 
+        output_file: str,
+        file_pattern: str = "ner_dataset_*.json",
+        exclude_summary: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Объединение нескольких JSON файлов в один
+        """
+        # Находим все JSON файлы по шаблону
+        pattern = os.path.join(input_dir, file_pattern)
+        json_files = glob.glob(pattern)
+        
+        if exclude_summary:
+            json_files = [f for f in json_files if "summary" not in f]
+        
+        if not json_files:
+            print(f"Не найдено файлов по шаблону: {pattern}")
+            return []
+        
+        merged_data = []
+        file_info = {}
+        
+        print(f"Найдено файлов для объединения: {len(json_files)}")
+        
+        for file_path in json_files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                if isinstance(data, list):
+                    merged_data.extend(data)
+                    file_info[os.path.basename(file_path)] = len(data)
+                    print(f"Добавлено {len(data)} записей из {os.path.basename(file_path)}")
+                else:
+                    print(f"Предупреждение: файл {file_path} не содержит список записей")
+                    
+            except Exception as e:
+                print(f"Ошибка при чтении файла {file_path}: {e}")
+        
+        # Сохраняем объединенный файл
+        self.save_to_json(merged_data, output_file)
+        
+        # Сохраняем информацию об объединении
+        merge_info = {
+            "merged_from": file_info,
+            "total_files": len(json_files),
+            "total_records": len(merged_data),
+            "output_file": output_file
+        }
+        
+        info_file = os.path.splitext(output_file)[0] + "_merge_info.json"
+        self.save_to_json(merge_info, info_file)
+        
+        print(f"Объединено файлов: {len(json_files)}")
+        print(f"Всего записей: {len(merged_data)}")
+        print(f"Объединенный файл: {output_file}")
+        print(f"Информация об объединении: {info_file}")
+        
+        return merged_data
+
+# ПРЯМОЕ УКАЗАНИЕ ПУТЕЙ В КОДЕ
+if __name__ == "__main__":
+    # УКАЖИТЕ ПУТИ К ФАЙЛАМ ЗДЕСЬ
+    INPUT_XML_FILE = "data.xml"  # Путь к вашему XML файлу
+    OUTPUT_DIR = "output"        # Директория для сохранения JSON файлов
+    
+    # Параметры конвертации
+    MAX_CHUNK_LENGTH = 1000      # Максимальная длина текстового чанка
+    LIMIT_PER_SERVICE = 1000     # Ограничение количества записей на сервис (None - без ограничения)
+    TAKE_FROM_END = True         # True - брать последние записи, False - брать первые
+    
+    # Проверяем существование входного файла
+    if not os.path.exists(INPUT_XML_FILE):
+        print(f"Ошибка: файл {INPUT_XML_FILE} не найден!")
+        print("Убедитесь, что файл существует в указанной директории.")
+        exit(1)
+    
+    # Создаем конвертер
+    converter = XMLToNERConverter(max_chunk_length=MAX_CHUNK_LENGTH)
+    
+    try:
+        # Конвертируем XML в JSON с группировкой по service
+        print("Начинаем конвертацию XML в JSON с группировкой по service...")
+        service_groups = converter.convert_xml_to_json_by_service(
+            xml_file_path=INPUT_XML_FILE,
+            output_dir=OUTPUT_DIR,
+            limit_per_service=LIMIT_PER_SERVICE,
+            take_from_end=TAKE_FROM_END
+        )
+        
+        print("\nКонвертация завершена успешно!")
+        
+        # Дополнительно: объединяем все файлы обратно в один
+        merge_choice = input("\nХотите объединить все файлы обратно в один? (y/n): ")
+        if merge_choice.lower() == 'y':
+            merged_output = os.path.join(OUTPUT_DIR, "merged_dataset.json")
+            converter.merge_json_files(OUTPUT_DIR, merged_output)
+            print("Объединение завершено!")
+            
+    except Exception as e:
+        print(f"Ошибка при конвертации: {e}")
+
+# ДОПОЛНИТЕЛЬНЫЙ СКРИПТ ДЛЯ ОБЪЕДИНЕНИЯ СУЩЕСТВУЮЩИХ ФАЙЛОВ
+def merge_existing_files():
+    """
+    Функция для объединения уже существующих JSON файлов
+    """
+    converter = XMLToNERConverter()
+    
+    # Укажите пути для объединения
+    INPUT_DIR = "output"           # Директория с JSON файлами
+    OUTPUT_FILE = "merged_dataset.json"  # Выходной файл
+    
+    print("Начинаем объединение JSON файлов...")
+    converter.merge_json_files(INPUT_DIR, OUTPUT_FILE)
+
+# Раскомментируйте следующую строку, если хотите запустить объединение отдельно
+# merge_existing_files()
