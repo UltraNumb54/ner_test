@@ -1,0 +1,146 @@
+pip install transformers torch datasets seqeval accelerate
+
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+import json
+
+class NERPredictor:
+    def __init__(self, model_path):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForTokenClassification.from_pretrained(model_path)
+        
+        # Загрузка информации о метках
+        with open(f"{model_path}/label_info.json", 'r', encoding='utf-8') as f:
+            label_info = json.load(f)
+            self.id2label = label_info['id2label']
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        self.model.eval()
+    
+    def predict(self, text):
+        """
+        Предсказание NER меток для текста
+        """
+        # Токенизация
+        tokens = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            return_offsets_mapping=True
+        )
+        
+        # Предсказание
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=tokens['input_ids'].to(self.device),
+                attention_mask=tokens['attention_mask'].to(self.device)
+            )
+        
+        # Получение предсказанных меток
+        predictions = torch.argmax(outputs.logits, dim=2)
+        predicted_labels = predictions[0].cpu().numpy()
+        
+        # Сопоставление токенов с метками
+        word_ids = tokens.word_ids(batch_index=0)
+        previous_word_idx = None
+        entities = []
+        current_entity = None
+        
+        for i, (word_idx, label_id) in enumerate(zip(word_ids, predicted_labels)):
+            if word_idx is None:
+                # Пропускаем специальные токены
+                continue
+            
+            label = self.id2label[str(label_id)]
+            
+            if word_idx != previous_word_idx:
+                # Новое слово
+                if current_entity is not None:
+                    entities.append(current_entity)
+                
+                if label.startswith('B-'):
+                    current_entity = {
+                        'entity': label[2:],
+                        'word': self.tokenizer.decode(tokens['input_ids'][0][i]),
+                        'start': i,
+                        'end': i
+                    }
+                elif label.startswith('I-'):
+                    current_entity = {
+                        'entity': label[2:],
+                        'word': self.tokenizer.decode(tokens['input_ids'][0][i]),
+                        'start': i,
+                        'end': i
+                    }
+                else:
+                    current_entity = None
+            else:
+                # Продолжение слова
+                if current_entity is not None and label.startswith('I-') and label[2:] == current_entity['entity']:
+                    current_entity['word'] += self.tokenizer.decode(tokens['input_ids'][0][i]).replace('##', '')
+                    current_entity['end'] = i
+                else:
+                    if current_entity is not None:
+                        entities.append(current_entity)
+                    current_entity = None
+            
+            previous_word_idx = word_idx
+        
+        # Добавляем последнюю сущность
+        if current_entity is not None:
+            entities.append(current_entity)
+        
+        return entities
+
+# Пример использования
+def example_usage():
+    predictor = NERPredictor("./trained_ner_model")
+    
+    text = "Иван Иванов живет в Москве и работает в компании Рога и копыта."
+    entities = predictor.predict(text)
+    
+    print(f"Текст: {text}")
+    print("Найденные сущности:")
+    for entity in entities:
+        print(f"  {entity['entity']}: {entity['word']}")
+
+if __name__ == "__main__":
+    example_usage()
+
+
+# config.py
+class TrainingConfig:
+    # Пути к данным
+    DATA_PATH = "ner_dataset.json"
+    OUTPUT_DIR = "./trained_ner_model"
+    
+    # Параметры модели
+    MODEL_NAME = "bert-base-multilingual-cased"
+    MAX_LENGTH = 512
+    
+    # Параметры обучения
+    BATCH_SIZE = 16
+    LEARNING_RATE = 2e-5
+    EPOCHS = 3
+    TRAIN_SIZE = 0.8
+    
+    # Дополнительные параметры
+    SEED = 42
+    WARMUP_STEPS = 500
+    WEIGHT_DECAY = 0.01
+
+
+#!/bin/bash
+# train_ner.sh
+
+echo "Запуск обучения NER модели..."
+
+# Активация виртуального окружения (если используется)
+# source venv/bin/activate
+
+# Запуск обучения
+python train_ner_model.py
+
+echo "Обучение завершено!"
