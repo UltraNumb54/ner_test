@@ -63,8 +63,8 @@ class TextPreprocessor:
         if text != original_text:
             replacements.append({
                 'type': 'remove_brackets',
-                'from': original_text,
-                'to': text
+                'from_text': original_text,
+                'to_text': text
             })
         
         return text, replacements
@@ -83,8 +83,8 @@ class TextPreprocessor:
         if text != original_text:
             replacements.append({
                 'type': 'remove_punctuation',
-                'from': original_text,
-                'to': text
+                'from_text': original_text,
+                'to_text': text
             })
         
         return text, replacements
@@ -100,8 +100,8 @@ class TextPreprocessor:
         if text != original_text:
             replacements.append({
                 'type': 'remove_digits',
-                'from': original_text,
-                'to': text
+                'from_text': original_text,
+                'to_text': text
             })
         
         return text, replacements
@@ -119,8 +119,8 @@ class TextPreprocessor:
         if text != original_text:
             replacements.append({
                 'type': 'remove_stopwords',
-                'from': original_text,
-                'to': text
+                'from_text': original_text,
+                'to_text': text
             })
         
         return text, replacements
@@ -146,8 +146,8 @@ class TextPreprocessor:
         if text != original_text:
             replacements.append({
                 'type': 'lemmatize',
-                'from': original_text,
-                'to': text
+                'from_text': original_text,
+                'to_text': text
             })
         
         return text, replacements
@@ -163,8 +163,8 @@ class TextPreprocessor:
         if text != original_text:
             replacements.append({
                 'type': 'to_lower',
-                'from': original_text,
-                'to': text
+                'from_text': original_text,
+                'to_text': text
             })
         
         return text, replacements
@@ -180,8 +180,8 @@ class TextPreprocessor:
         if text != original_text:
             replacements.append({
                 'type': 'collapse_spaces',
-                'from': original_text,
-                'to': text
+                'from_text': original_text,
+                'to_text': text
             })
         
         return text, replacements
@@ -229,8 +229,17 @@ class NERTextProcessor:
         """
         Инициализация NER модели для обработки текста
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForTokenClassification.from_pretrained(model_path)
+        # Явно указываем использование BertTokenizer для избежания проблем с Mistral
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=True,  # Гарантируем, что используем только локальные файлы
+            trust_remote_code=False  # Отключаем выполнение удаленного кода
+        )
+        self.model = AutoModelForTokenClassification.from_pretrained(
+            model_path,
+            local_files_only=True,
+            trust_remote_code=False
+        )
         
         # Загрузка информации о метках
         with open(f"{model_path}/label_info.json", 'r', encoding='utf-8') as f:
@@ -238,8 +247,13 @@ class NERTextProcessor:
             self.id2label = label_info['id2label']
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Используется устройство: {self.device}")
         self.model.to(self.device)
         self.model.eval()
+        
+        # Гарантируем, что данные не отправляются
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+        os.environ['HF_DATASETS_OFFLINE'] = '1'
     
     def replace_entities(self, text: str) -> Tuple[str, List[Dict]]:
         """
@@ -450,25 +464,37 @@ class JSONPreprocessor:
             return []
         
         merged = []
-        current = replacements[0]
         
-        for i in range(1, len(replacements)):
-            next_replacement = replacements[i]
-            
-            # Проверяем, можно ли объединить текущую и следующую замену
-            if (current.get('type') == next_replacement.get('type') and 
-                current.get('to') == next_replacement.get('from')):
-                # Объединяем
-                current = {
-                    'type': current['type'],
-                    'from': current['from'],
-                    'to': next_replacement['to']
-                }
+        # Группируем замены по типу
+        type_groups = {}
+        for replacement in replacements:
+            rep_type = replacement.get('type')
+            if rep_type not in type_groups:
+                type_groups[rep_type] = []
+            type_groups[rep_type].append(replacement)
+        
+        # Объединяем замены в каждой группе
+        for rep_type, group in type_groups.items():
+            if rep_type == 'ner_replacement':
+                # Для NER замен не объединяем, так как у них другая структура
+                merged.extend(group)
             else:
-                merged.append(current)
-                current = next_replacement
+                # Для других типов объединяем последовательные замены
+                current = None
+                for rep in group:
+                    if current is None:
+                        current = rep
+                    else:
+                        # Проверяем, можно ли объединить
+                        if (current.get('to_text') == rep.get('from_text')):
+                            current['to_text'] = rep['to_text']
+                        else:
+                            merged.append(current)
+                            current = rep
+                
+                if current is not None:
+                    merged.append(current)
         
-        merged.append(current)
         return merged
 
 def main():
