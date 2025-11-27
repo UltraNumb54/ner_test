@@ -7,10 +7,11 @@ from transformers import (
     Trainer,
     DataCollatorForTokenClassification
 )
-from datasets import Dataset, load_metric
+from datasets import Dataset
 import numpy as np
 from sklearn.model_selection import train_test_split
 import os
+import evaluate
 
 class NERModelTrainer:
     def __init__(self, model_name="bert-base-multilingual-cased", max_length=512):
@@ -31,7 +32,67 @@ class NERModelTrainer:
         labeled_data = [item for item in data if item.get('success', False)]
         
         print(f"Загружено {len(labeled_data)} размеченных примеров из {len(data)} всего")
-        return labeled_data
+        
+        # Проверяем и исправляем метки
+        validated_data = self.validate_and_fix_labels(labeled_data)
+        
+        return validated_data
+    
+    def validate_and_fix_labels(self, data):
+        """
+        Проверяет и исправляет несогласованные метки в данных
+        """
+        valid_data = []
+        invalid_count = 0
+        
+        for item in data:
+            tokens = item['tokens']
+            ner_tags = item['ner_tags']
+            
+            # Проверяем корректность последовательности меток
+            if self.is_valid_sequence(ner_tags):
+                valid_data.append(item)
+            else:
+                print(f"Обнаружена некорректная последовательность в примере {item['id']}")
+                print(f"Текст: {item['original_text'][:100]}...")
+                print(f"Токены: {tokens}")
+                print(f"Метки: {ner_tags}")
+                
+                # Исправляем метки (превращаем проблемные I- в O)
+                fixed_tags = self.fix_inconsistent_tags(ner_tags)
+                item['ner_tags'] = fixed_tags
+                valid_data.append(item)
+                invalid_count += 1
+        
+        print(f"Исправлено {invalid_count} примеров с некорректными метками")
+        return valid_data
+    
+    def is_valid_sequence(self, tags):
+        """
+        Проверяет, что последовательность меток корректна
+        """
+        for i, tag in enumerate(tags):
+            if tag.startswith('I-'):
+                # I- метка должна следовать за B- или I- той же сущности
+                entity_type = tag[2:]
+                if i == 0 or (tags[i-1] != f'B-{entity_type}' and tags[i-1] != f'I-{entity_type}'):
+                    return False
+        return True
+    
+    def fix_inconsistent_tags(self, tags):
+        """
+        Исправляет несогласованные метки
+        """
+        fixed_tags = tags.copy()
+        
+        for i, tag in enumerate(fixed_tags):
+            if tag.startswith('I-'):
+                entity_type = tag[2:]
+                # Если I- метка стоит в начале или после другой сущности, превращаем её в O
+                if i == 0 or (fixed_tags[i-1] != f'B-{entity_type}' and fixed_tags[i-1] != f'I-{entity_type}'):
+                    fixed_tags[i] = 'O'
+        
+        return fixed_tags
     
     def extract_labels_from_data(self, data):
         """
@@ -127,26 +188,39 @@ class NERModelTrainer:
     
     def compute_metrics(self, eval_pred):
         """
-        Вычисление метрик для оценки модели
+        Исправленная функция вычисления метрик
         """
-        metric = load_metric("seqeval")
+        metric = evaluate.load("seqeval")
+        
         predictions, labels = eval_pred
         
-        # Преобразуем предсказания в метки
+        # Убеждаемся, что predictions и labels имеют правильную форму
+        if isinstance(predictions, tuple):
+            predictions = predictions[0]
+        
+        # Преобразуем предсказания в индексы меток
         predictions = np.argmax(predictions, axis=2)
         
-        true_predictions = [
-            [self.id2label[p] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
-        true_labels = [
-            [self.id2label[l] for (p, l) in zip(prediction, label) if l != -100]
-            for prediction, label in zip(predictions, labels)
-        ]
+        # Преобразуем в строковые метки
+        true_predictions = []
+        true_labels = []
         
+        for prediction, label in zip(predictions, labels):
+            pred_sequence = []
+            label_sequence = []
+            
+            for p, l in zip(prediction, label):
+                # Игнорируем специальные токены (label = -100)
+                if l != -100:
+                    pred_sequence.append(self.id2label[str(p)])
+                    label_sequence.append(self.id2label[str(l)])
+            
+            true_predictions.append(pred_sequence)
+            true_labels.append(label_sequence)
+        
+        # Вычисляем метрики
         results = metric.compute(predictions=true_predictions, references=true_labels)
         
-        # Возвращаем основные метрики
         return {
             "precision": results["overall_precision"],
             "recall": results["overall_recall"],
@@ -178,6 +252,10 @@ class NERModelTrainer:
         )
         
         print(f"Разделение данных: {len(train_data)} train, {len(val_data)} validation")
+        
+        # Проверяем, что в данных есть примеры
+        if len(train_data) == 0 or len(val_data) == 0:
+            raise ValueError("После разделения один из наборов данных пуст!")
         
         # Подготовка датасетов
         print("Подготовка датасетов...")
@@ -218,6 +296,7 @@ class NERModelTrainer:
             seed=42,
             data_seed=42,
             warmup_steps=500,
+            remove_unused_columns=False,  # Важно для корректной работы
         )
         
         # Тренер
@@ -240,7 +319,7 @@ class NERModelTrainer:
         trainer.save_model(output_dir)
         self.tokenizer.save_pretrained(output_dir)
         
-        # Сохранение информации о метлах ВМЕСТЕ с моделью
+        # Сохранение информации о метках ВМЕСТЕ с моделью
         label_info = {
             'label2id': self.label2id,
             'id2label': self.id2label
@@ -290,6 +369,8 @@ def main():
         
     except Exception as e:
         print(f"Ошибка при обучении: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
