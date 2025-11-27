@@ -4,6 +4,7 @@ import re
 import html
 from typing import List, Dict, Any
 import os
+import numpy as np
 
 class XMLToInferenceConverter:
     def __init__(self, max_chunk_length: int = 1000):
@@ -109,6 +110,25 @@ class XMLToInferenceConverter:
         
         return ' '.join(text_parts)
     
+    def convert_numpy_types(self, obj):
+        """
+        Рекурсивно преобразует numpy типы в нативные Python типы для JSON сериализации
+        """
+        if isinstance(obj, dict):
+            return {key: self.convert_numpy_types(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self.convert_numpy_types(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        else:
+            return str(obj)
+    
     def convert_xml_to_inference_format(self, xml_file_path: str, output_file: str = None) -> List[Dict[str, Any]]:
         """
         Конвертация XML в формат для инференса
@@ -186,6 +206,9 @@ class XMLToInferenceConverter:
         print(f"Создано чанков: {chunk_count}")
         print(f"Всего элементов для инференса: {len(dataset)}")
         
+        # Преобразуем numpy типы в нативные Python типы
+        dataset = self.convert_numpy_types(dataset)
+        
         # Сохраняем в файл если указан output
         if output_file:
             self.save_to_json(dataset, output_file)
@@ -195,10 +218,234 @@ class XMLToInferenceConverter:
     
     def save_to_json(self, dataset: List[Dict], output_file: str):
         """
-        Сохранение датасета в JSON файл
+        Сохранение датасета в JSON файл с обработкой numpy типов
         """
+        # Дополнительная проверка на numpy типы
+        def default_serializer(obj):
+            if isinstance(obj, (np.integer, np.int64)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+        
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(dataset, f, ensure_ascii=False, indent=2)
+            json.dump(dataset, f, ensure_ascii=False, indent=2, default=default_serializer)
+
+# Обновленный класс TextPreprocessor для защиты NER меток
+class TextPreprocessor:
+    def __init__(self, 
+                 remove_brackets: bool = True,
+                 to_lower: bool = True,
+                 remove_punctuation: bool = True,
+                 remove_digits: bool = True,
+                 remove_stopwords: bool = True,
+                 lemmatize: bool = False,
+                 protect_ner_tags: bool = True):  # Новый параметр для защиты меток
+        
+        self.remove_brackets = remove_brackets
+        self.to_lower = to_lower
+        self.remove_punctuation = remove_punctuation
+        self.remove_digits = remove_digits
+        self.remove_stopwords = remove_stopwords
+        self.lemmatize = lemmatize
+        self.protect_ner_tags = protect_ner_tags  # Защищать ли NER метки [ENTITY]
+        
+        # Базовый список стоп-слов для русского языка
+        self.stopwords = set([
+            'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 'все', 'она', 'так', 'его', 
+            'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только', 'ее', 'мне', 'было', 'вот', 'от', 
+            'меня', 'еще', 'нет', 'о', 'из', 'ему', 'теперь', 'когда', 'даже', 'ну', 'вдруг', 'ли', 'если', 'уже', 
+            'или', 'ни', 'быть', 'был', 'него', 'до', 'вас', 'нибудь', 'опять', 'уж', 'вам', 'ведь', 'там', 'потом', 
+            'себя', 'ничего', 'ей', 'может', 'они', 'тут', 'где', 'есть', 'надо', 'ней', 'для', 'мы', 'тебя', 'их', 
+            'чем', 'была', 'сам', 'чтоб', 'без', 'будто', 'чего', 'раз', 'тоже', 'себе', 'под', 'будет', 'ж', 'тогда', 
+            'кто', 'этот', 'того', 'потому', 'этого', 'какой', 'совсем', 'ним', 'здесь', 'этом', 'один', 'почти', 
+            'мой', 'тем', 'чтобы', 'нее', 'сейчас', 'были', 'куда', 'зачем', 'всех', 'никогда', 'можно', 'при', 'наконец', 
+            'два', 'об', 'другой', 'хоть', 'после', 'над', 'больше', 'тот', 'через', 'эти', 'нас', 'про', 'всего', 
+            'них', 'какая', 'много', 'разве', 'три', 'эту', 'моя', 'впрочем', 'хорошо', 'свою', 'этой', 'перед', 'иногда', 
+            'лучше', 'чуть', 'том', 'нельзя', 'такой', 'им', 'более', 'всегда', 'конечно', 'всю', 'между'
+        ])
+        
+        # Инициализация лемматизатора
+        if self.lemmatize:
+            self.morph = pymorphy3.MorphAnalyzer()
+    
+    def remove_bracket_content(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Удаление всего в [], {}, <> включая сами скобки
+        Но если protect_ner_tags=True, то защищаем NER метки [ENTITY]
+        """
+        original_text = text
+        
+        if self.protect_ner_tags:
+            # Временная замена NER меток перед удалением скобок
+            ner_pattern = r'\[([A-Z_]+)\]'
+            ner_matches = list(re.finditer(ner_pattern, text))
+            
+            # Временные метки для защиты NER
+            protected_text = text
+            replacements = {}
+            
+            for i, match in enumerate(ner_matches):
+                placeholder = f"__NER_{i}__"
+                replacements[placeholder] = match.group(0)  # Сохраняем оригинальную метку
+                protected_text = protected_text.replace(match.group(0), placeholder, 1)
+            
+            # Удаляем остальные скобки
+            protected_text = re.sub(r'\[.*?\]', '', protected_text)
+            protected_text = re.sub(r'\{.*?\}', '', protected_text)
+            protected_text = re.sub(r'\<.*?\>', '', protected_text)
+            
+            # Восстанавливаем NER метки
+            text = protected_text
+            for placeholder, ner_tag in replacements.items():
+                text = text.replace(placeholder, ner_tag)
+        else:
+            # Стандартное удаление скобок
+            text = re.sub(r'\[.*?\]', '', text)
+            text = re.sub(r'\{.*?\}', '', text)
+            text = re.sub(r'\<.*?\>', '', text)
+        
+        # Убираем лишние пробелы после удаления
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        replacements_list = []
+        if text != original_text:
+            replacements_list.append({
+                'type': 'remove_brackets',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements_list
+    
+    def remove_punctuation_and_special(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Замена всей пунктуации и спецсимволов на пробел
+        Но если protect_ner_tags=True, то защищаем NER метки [ENTITY]
+        """
+        original_text = text
+        
+        if self.protect_ner_tags:
+            # Временная замена NER меток
+            ner_pattern = r'\[([A-Z_]+)\]'
+            ner_matches = list(re.finditer(ner_pattern, text))
+            
+            protected_text = text
+            replacements = {}
+            
+            for i, match in enumerate(ner_matches):
+                placeholder = f"__NER_{i}__"
+                replacements[placeholder] = match.group(0)
+                protected_text = protected_text.replace(match.group(0), placeholder, 1)
+            
+            # Применяем стандартную обработку пунктуации
+            import string
+            translator = str.maketrans(string.punctuation + '«»—…', ' ' * (len(string.punctuation) + 4))
+            protected_text = protected_text.translate(translator)
+            
+            # Восстанавливаем NER метки
+            text = protected_text
+            for placeholder, ner_tag in replacements.items():
+                text = text.replace(placeholder, ner_tag)
+        else:
+            # Стандартная обработка пунктуации
+            import string
+            translator = str.maketrans(string.punctuation + '«»—…', ' ' * (len(string.punctuation) + 4))
+            text = text.translate(translator)
+        
+        replacements_list = []
+        if text != original_text:
+            replacements_list.append({
+                'type': 'remove_punctuation',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements_list
+    
+    def to_lower_case(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Приведение текста к нижнему регистру
+        Но если protect_ner_tags=True, то защищаем NER метки [ENTITY]
+        """
+        original_text = text
+        
+        if self.protect_ner_tags:
+            # Временная замена NER меток
+            ner_pattern = r'\[([A-Z_]+)\]'
+            ner_matches = list(re.finditer(ner_pattern, text))
+            
+            protected_text = text
+            replacements = {}
+            
+            for i, match in enumerate(ner_matches):
+                placeholder = f"__NER_{i}__"
+                replacements[placeholder] = match.group(0)
+                protected_text = protected_text.replace(match.group(0), placeholder, 1)
+            
+            # Применяем нижний регистр
+            protected_text = protected_text.lower()
+            
+            # Восстанавливаем NER метки
+            text = protected_text
+            for placeholder, ner_tag in replacements.items():
+                text = text.replace(placeholder, ner_tag)
+        else:
+            text = text.lower()
+        
+        replacements_list = []
+        if text != original_text:
+            replacements_list.append({
+                'type': 'to_lower',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements_list
+    
+    # Остальные методы класса TextPreprocessor остаются без изменений
+    # но будут использовать protect_ner_tags там где это необходимо
+    
+    def remove_digits_from_text(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Удаление цифр из текста (не затрагивает NER метки)
+        """
+        original_text = text
+        
+        if self.protect_ner_tags:
+            # Временная замена NER меток
+            ner_pattern = r'\[([A-Z_]+)\]'
+            ner_matches = list(re.finditer(ner_pattern, text))
+            
+            protected_text = text
+            replacements = {}
+            
+            for i, match in enumerate(ner_matches):
+                placeholder = f"__NER_{i}__"
+                replacements[placeholder] = match.group(0)
+                protected_text = protected_text.replace(match.group(0), placeholder, 1)
+            
+            # Удаляем цифры
+            protected_text = re.sub(r'\d+', '', protected_text)
+            
+            # Восстанавливаем NER метки
+            text = protected_text
+            for placeholder, ner_tag in replacements.items():
+                text = text.replace(placeholder, ner_tag)
+        else:
+            text = re.sub(r'\d+', '', text)
+        
+        replacements_list = []
+        if text != original_text:
+            replacements_list.append({
+                'type': 'remove_digits',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements_list
 
 # Прямое указание путей в коде
 if __name__ == "__main__":
