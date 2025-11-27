@@ -42,17 +42,32 @@ class TextPreprocessor:
         if self.lemmatize:
             self.morph = pymorphy3.MorphAnalyzer()
     
-    def remove_bracket_content(self, text: str) -> str:
+    def remove_bracket_content(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Удаление всего в [], {}, <> включая сами скобки
+        Возвращает обработанный текст и список замен
         """
+        original_text = text
+        
         # Удаляем содержимое в квадратных скобках
         text = re.sub(r'\[.*?\]', '', text)
         # Удаляем содержимое в фигурных скобках
         text = re.sub(r'\{.*?\}', '', text)
         # Удаляем содержимое в угловых скобках
         text = re.sub(r'\<.*?\>', '', text)
-        return text
+        
+        # Убираем лишние пробелы после удаления
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'step': 'remove_brackets',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements
     
     def remove_punctuation_and_special(self, text: str) -> str:
         """
@@ -99,9 +114,10 @@ class TextPreprocessor:
         """
         return re.sub(r'\s+', ' ', text).strip()
     
-    def preprocess_text(self, text: str) -> Tuple[str, List[Dict[str, str]]]:
+    def preprocess_text_without_brackets(self, text: str) -> Tuple[str, List[Dict[str, str]]]:
         """
-        Полная предобработка текста с отслеживанием замен
+        Полная предобработка текста БЕЗ удаления скобок (т.к. это уже сделано)
+        с отслеживанием замен
         """
         original_text = text
         replacements = []
@@ -109,18 +125,7 @@ class TextPreprocessor:
         # Сохраняем промежуточные результаты для отслеживания изменений
         current_text = text
         
-        # 1. Удаление содержимого в скобках
-        if self.remove_brackets:
-            text_after_brackets = self.remove_bracket_content(current_text)
-            if text_after_brackets != current_text:
-                replacements.append({
-                    'step': 'remove_brackets',
-                    'from': current_text,
-                    'to': text_after_brackets
-                })
-            current_text = text_after_brackets
-        
-        # 2. Приведение к нижнему регистру
+        # 1. Приведение к нижнему регистру
         if self.to_lower:
             text_lower = current_text.lower()
             if text_lower != current_text:
@@ -131,7 +136,7 @@ class TextPreprocessor:
                 })
             current_text = text_lower
         
-        # 3. Замена пунктуации и спецсимволов на пробел
+        # 2. Замена пунктуации и спецсимволов на пробел
         if self.remove_punctuation:
             text_no_punct = self.remove_punctuation_and_special(current_text)
             if text_no_punct != current_text:
@@ -142,7 +147,7 @@ class TextPreprocessor:
                 })
             current_text = text_no_punct
         
-        # 4. Удаление цифр
+        # 3. Удаление цифр
         if self.remove_digits:
             text_no_digits = self.remove_digits_from_text(current_text)
             if text_no_digits != current_text:
@@ -153,7 +158,7 @@ class TextPreprocessor:
                 })
             current_text = text_no_digits
         
-        # 5. Удаление стоп-слов
+        # 4. Удаление стоп-слов
         if self.remove_stopwords:
             text_no_stopwords = self.remove_stopwords_from_text(current_text)
             if text_no_stopwords != current_text:
@@ -164,7 +169,7 @@ class TextPreprocessor:
                 })
             current_text = text_no_stopwords
         
-        # 6. Лемматизация
+        # 5. Лемматизация
         if self.lemmatize:
             text_lemmatized = self.lemmatize_text(current_text)
             if text_lemmatized != current_text:
@@ -175,7 +180,7 @@ class TextPreprocessor:
                 })
             current_text = text_lemmatized
         
-        # 7. Удаление лишних пробелов (всегда применяется)
+        # 6. Удаление лишних пробелов (всегда применяется)
         final_text = self.collapse_spaces(current_text)
         if final_text != current_text:
             replacements.append({
@@ -207,14 +212,38 @@ class NERTextProcessor:
         """
         Замена сущностей в тексте с помощью NER модели
         """
-        # Токенизация текста
-        tokens = self._tokenize_text(text)
-        
-        if not tokens:
+        if not text or text.strip() == "":
             return text, []
         
-        # Предсказание сущностей
-        entities = self._extract_entities(text)
+        # Токенизация текста для BERT
+        inputs = self.tokenizer(
+            text,
+            return_offsets_mapping=True,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt"
+        )
+        
+        # Извлекаем offset_mapping отдельно
+        offset_mapping = inputs['offset_mapping']
+        
+        # Удаляем offset_mapping из inputs для модели
+        inputs_for_model = {k: v for k, v in inputs.items() if k != 'offset_mapping'}
+        
+        # Перенос на устройство
+        inputs_for_model = {k: v.to(self.device) for k, v in inputs_for_model.items()}
+        
+        # Предсказание
+        with torch.no_grad():
+            outputs = self.model(**inputs_for_model)
+        
+        # Получение предсказанных меток
+        predictions = torch.argmax(outputs.logits, dim=2)
+        predicted_labels = predictions[0].cpu().numpy()
+        
+        # Выравнивание меток с исходным текстом
+        entities = self._extract_entities_from_predictions(text, predicted_labels, offset_mapping[0])
         
         # Замена сущностей в тексте
         replaced_text = text
@@ -241,56 +270,21 @@ class NERTextProcessor:
         
         return replaced_text, entity_replacements
     
-    def _tokenize_text(self, text: str) -> List[str]:
+    def _extract_entities_from_predictions(self, text: str, predictions: np.ndarray, offset_mapping: torch.Tensor) -> List[Dict]:
         """
-        Токенизация текста
+        Извлечение сущностей из предсказаний модели
         """
-        if not text:
-            return []
-        
-        token_regex = r'[\w\u0400-\u04FF@]+|[^\w\s]|_+'
-        tokens = re.findall(token_regex, text)
-        
-        return [token for token in tokens if token.strip()]
-    
-    def _extract_entities(self, text: str) -> List[Dict]:
-        """
-        Извлечение сущностей из текста с помощью NER модели
-        """
-        # Токенизация для модели BERT
-        inputs = self.tokenizer(
-            text,
-            return_offsets_mapping=True,
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt"
-        )
-        
-        # Перенос на устройство
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        # Предсказание
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-        
-        # Получение предсказанных меток
-        predictions = torch.argmax(outputs.logits, dim=2)
-        predicted_labels = predictions[0].cpu().numpy()
-        
-        # Выравнивание меток с исходным текстом
-        word_ids = inputs.word_ids(batch_index=0)
-        offset_mapping = inputs['offset_mapping'][0].cpu().numpy()
-        
         entities = []
         current_entity = None
         
-        for i, (word_idx, pred_idx) in enumerate(zip(word_ids, predicted_labels)):
-            if word_idx is None:
+        offset_mapping = offset_mapping.cpu().numpy()
+        
+        for i, (pred_idx, offset) in enumerate(zip(predictions, offset_mapping)):
+            # Пропускаем специальные токены
+            if offset[0] == offset[1] == 0:
                 continue
             
             label = self.id2label[str(pred_idx)]
-            start, end = offset_mapping[i]
             
             if label.startswith('B-'):
                 # Начало новой сущности
@@ -299,28 +293,28 @@ class NERTextProcessor:
                 
                 current_entity = {
                     'entity': label[2:],
-                    'text': text[start:end],
-                    'start': start,
-                    'end': end
+                    'text': text[offset[0]:offset[1]],
+                    'start': offset[0],
+                    'end': offset[1]
                 }
             elif label.startswith('I-'):
                 # Продолжение сущности
                 if current_entity is not None and label[2:] == current_entity['entity']:
                     # Расширяем текущую сущность
-                    current_entity['text'] = text[current_entity['start']:end]
-                    current_entity['end'] = end
+                    current_entity['text'] = text[current_entity['start']:offset[1]]
+                    current_entity['end'] = offset[1]
                 else:
                     # Некорректная I- метка, начинаем новую сущность
                     if current_entity is not None:
                         entities.append(current_entity)
                     current_entity = {
                         'entity': label[2:],
-                        'text': text[start:end],
-                        'start': start,
-                        'end': end
+                        'text': text[offset[0]:offset[1]],
+                        'start': offset[0],
+                        'end': offset[1]
                     }
             else:
-                # Конец сущности
+                # Конец сущности (метка 'O')
                 if current_entity is not None:
                     entities.append(current_entity)
                     current_entity = None
@@ -347,21 +341,38 @@ class JSONPreprocessor:
         result1 = []  # Для первого файла: оригинальный текст, обработанный текст, замены
         result2 = []  # Для второго файла: id, service, topic, текст, attachments
         
-        for item in data:
+        print(f"Начата обработка {len(data)} записей...")
+        
+        for i, item in enumerate(data):
+            if i % 10 == 0:
+                print(f"Обработано {i}/{len(data)} записей...")
+            
             # Обработка основного текста
             original_text = item.get('original_text', '')
             topic = item.get('metadata', {}).get('topic', '')
             
-            # Применяем NER замену к тексту и topic
-            text_with_ner, text_ner_replacements = self.ner_processor.replace_entities(original_text)
-            topic_with_ner, topic_ner_replacements = self.ner_processor.replace_entities(topic)
+            all_replacements = []
             
-            # Применяем полную предобработку к тексту с NER
-            processed_text, text_preprocessing_replacements = self.text_preprocessor.preprocess_text(text_with_ner)
-            processed_topic, topic_preprocessing_replacements = self.text_preprocessor.preprocess_text(topic_with_ner)
+            # 1. Сначала удаляем скобки из текста и topic
+            text_after_brackets, text_bracket_replacements = self.text_preprocessor.remove_bracket_content(original_text)
+            topic_after_brackets, topic_bracket_replacements = self.text_preprocessor.remove_bracket_content(topic)
             
-            # Объединяем все замены
-            all_replacements = text_ner_replacements + topic_ner_replacements + text_preprocessing_replacements + topic_preprocessing_replacements
+            all_replacements.extend(text_bracket_replacements)
+            all_replacements.extend(topic_bracket_replacements)
+            
+            # 2. Затем применяем NER к тексту после удаления скобок
+            text_with_ner, text_ner_replacements = self.ner_processor.replace_entities(text_after_brackets)
+            topic_with_ner, topic_ner_replacements = self.ner_processor.replace_entities(topic_after_brackets)
+            
+            all_replacements.extend(text_ner_replacements)
+            all_replacements.extend(topic_ner_replacements)
+            
+            # 3. Затем применяем остальные шаги предобработки к тексту с NER
+            processed_text, text_preprocessing_replacements = self.text_preprocessor.preprocess_text_without_brackets(text_with_ner)
+            processed_topic, topic_preprocessing_replacements = self.text_preprocessor.preprocess_text_without_brackets(topic_with_ner)
+            
+            all_replacements.extend(text_preprocessing_replacements)
+            all_replacements.extend(topic_preprocessing_replacements)
             
             # Объединяем последовательные замены одного типа
             merged_replacements = self._merge_consecutive_replacements(all_replacements)
@@ -434,7 +445,7 @@ def main():
     
     # Настройки предобработки
     PREPROCESSOR_CONFIG = {
-        "remove_brackets": True,
+        "remove_brackets": True,  # Указываем True, но удаление скобок делаем отдельно до NER
         "to_lower": True,
         "remove_punctuation": True,
         "remove_digits": True,
