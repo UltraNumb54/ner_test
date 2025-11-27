@@ -62,43 +62,77 @@ class TextPreprocessor:
         replacements = []
         if text != original_text:
             replacements.append({
-                'step': 'remove_brackets',
+                'type': 'remove_brackets',
                 'from': original_text,
                 'to': text
             })
         
         return text, replacements
     
-    def remove_punctuation_and_special(self, text: str) -> str:
+    def remove_punctuation_and_special(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Замена всей пунктуации и спецсимволов на пробел
         """
+        original_text = text
+        
         # Создаем таблицу переводов для замены пунктуации на пробелы
         translator = str.maketrans(string.punctuation + '«»—…', ' ' * (len(string.punctuation) + 4))
         text = text.translate(translator)
-        return text
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'remove_punctuation',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements
     
-    def remove_digits_from_text(self, text: str) -> str:
+    def remove_digits_from_text(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Удаление цифр из текста
         """
-        return re.sub(r'\d+', '', text)
+        original_text = text
+        text = re.sub(r'\d+', '', text)
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'remove_digits',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements
     
-    def remove_stopwords_from_text(self, text: str) -> str:
+    def remove_stopwords_from_text(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Удаление стоп-слов из текста
         """
+        original_text = text
         words = text.split()
         filtered_words = [word for word in words if word.lower() not in self.stopwords]
-        return ' '.join(filtered_words)
+        text = ' '.join(filtered_words)
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'remove_stopwords',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements
     
-    def lemmatize_text(self, text: str) -> str:
+    def lemmatize_text(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Приведение слов к начальной форме (лемматизация)
         """
         if not hasattr(self, 'morph'):
-            return text
+            return text, []
         
+        original_text = text
         words = text.split()
         lemmatized_words = []
         
@@ -106,90 +140,89 @@ class TextPreprocessor:
             parsed = self.morph.parse(word)[0]
             lemmatized_words.append(parsed.normal_form)
         
-        return ' '.join(lemmatized_words)
+        text = ' '.join(lemmatized_words)
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'lemmatize',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements
     
-    def collapse_spaces(self, text: str) -> str:
+    def to_lower_case(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Приведение текста к нижнему регистру
+        """
+        original_text = text
+        text = text.lower()
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'to_lower',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements
+    
+    def collapse_spaces(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Замена нескольких подряд идущих пробелов на один
         """
-        return re.sub(r'\s+', ' ', text).strip()
-    
-    def preprocess_text_without_brackets(self, text: str) -> Tuple[str, List[Dict[str, str]]]:
-        """
-        Полная предобработка текста БЕЗ удаления скобок (т.к. это уже сделано)
-        с отслеживанием замен
-        """
         original_text = text
-        replacements = []
+        text = re.sub(r'\s+', ' ', text).strip()
         
-        # Сохраняем промежуточные результаты для отслеживания изменений
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'collapse_spaces',
+                'from': original_text,
+                'to': text
+            })
+        
+        return text, replacements
+    
+    def preprocess_text_after_ner(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Полная предобработка текста ПОСЛЕ применения NER
+        """
         current_text = text
+        all_replacements = []
         
         # 1. Приведение к нижнему регистру
         if self.to_lower:
-            text_lower = current_text.lower()
-            if text_lower != current_text:
-                replacements.append({
-                    'step': 'to_lower',
-                    'from': current_text,
-                    'to': text_lower
-                })
-            current_text = text_lower
+            current_text, replacements = self.to_lower_case(current_text)
+            all_replacements.extend(replacements)
         
         # 2. Замена пунктуации и спецсимволов на пробел
         if self.remove_punctuation:
-            text_no_punct = self.remove_punctuation_and_special(current_text)
-            if text_no_punct != current_text:
-                replacements.append({
-                    'step': 'remove_punctuation',
-                    'from': current_text,
-                    'to': text_no_punct
-                })
-            current_text = text_no_punct
+            current_text, replacements = self.remove_punctuation_and_special(current_text)
+            all_replacements.extend(replacements)
         
         # 3. Удаление цифр
         if self.remove_digits:
-            text_no_digits = self.remove_digits_from_text(current_text)
-            if text_no_digits != current_text:
-                replacements.append({
-                    'step': 'remove_digits',
-                    'from': current_text,
-                    'to': text_no_digits
-                })
-            current_text = text_no_digits
+            current_text, replacements = self.remove_digits_from_text(current_text)
+            all_replacements.extend(replacements)
         
         # 4. Удаление стоп-слов
         if self.remove_stopwords:
-            text_no_stopwords = self.remove_stopwords_from_text(current_text)
-            if text_no_stopwords != current_text:
-                replacements.append({
-                    'step': 'remove_stopwords',
-                    'from': current_text,
-                    'to': text_no_stopwords
-                })
-            current_text = text_no_stopwords
+            current_text, replacements = self.remove_stopwords_from_text(current_text)
+            all_replacements.extend(replacements)
         
         # 5. Лемматизация
         if self.lemmatize:
-            text_lemmatized = self.lemmatize_text(current_text)
-            if text_lemmatized != current_text:
-                replacements.append({
-                    'step': 'lemmatize',
-                    'from': current_text,
-                    'to': text_lemmatized
-                })
-            current_text = text_lemmatized
+            current_text, replacements = self.lemmatize_text(current_text)
+            all_replacements.extend(replacements)
         
         # 6. Удаление лишних пробелов (всегда применяется)
-        final_text = self.collapse_spaces(current_text)
-        if final_text != current_text:
-            replacements.append({
-                'step': 'collapse_spaces',
-                'from': current_text,
-                'to': final_text
-            })
+        current_text, replacements = self.collapse_spaces(current_text)
+        all_replacements.extend(replacements)
         
-        return final_text, replacements
+        return current_text, all_replacements
 
 class NERTextProcessor:
     def __init__(self, model_path: str):
@@ -215,60 +248,65 @@ class NERTextProcessor:
         if not text or text.strip() == "":
             return text, []
         
-        # Токенизация текста для BERT
-        inputs = self.tokenizer(
-            text,
-            return_offsets_mapping=True,
-            padding=True,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt"
-        )
-        
-        # Извлекаем offset_mapping отдельно
-        offset_mapping = inputs['offset_mapping']
-        
-        # Удаляем offset_mapping из inputs для модели
-        inputs_for_model = {k: v for k, v in inputs.items() if k != 'offset_mapping'}
-        
-        # Перенос на устройство
-        inputs_for_model = {k: v.to(self.device) for k, v in inputs_for_model.items()}
-        
-        # Предсказание
-        with torch.no_grad():
-            outputs = self.model(**inputs_for_model)
-        
-        # Получение предсказанных меток
-        predictions = torch.argmax(outputs.logits, dim=2)
-        predicted_labels = predictions[0].cpu().numpy()
-        
-        # Выравнивание меток с исходным текстом
-        entities = self._extract_entities_from_predictions(text, predicted_labels, offset_mapping[0])
-        
-        # Замена сущностей в тексте
-        replaced_text = text
-        entity_replacements = []
-        
-        # Сортируем сущности по позиции начала (в обратном порядке для корректной замены)
-        sorted_entities = sorted(entities, key=lambda x: x['start'], reverse=True)
-        
-        for entity in sorted_entities:
-            original_text = entity['text']
-            entity_type = entity['entity']
-            replacement = f"[{entity_type}]"
+        try:
+            # Токенизация текста для BERT
+            inputs = self.tokenizer(
+                text,
+                return_offsets_mapping=True,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt"
+            )
             
-            # Заменяем в тексте
-            replaced_text = replaced_text[:entity['start']] + replacement + replaced_text[entity['end']:]
+            # Извлекаем offset_mapping отдельно
+            offset_mapping = inputs['offset_mapping']
             
-            entity_replacements.append({
-                'type': 'ner_replacement',
-                'entity_type': entity_type,
-                'original': original_text,
-                'replacement': replacement,
-                'position': (entity['start'], entity['end'])
-            })
+            # Удаляем offset_mapping из inputs для модели
+            inputs_for_model = {k: v for k, v in inputs.items() if k != 'offset_mapping'}
+            
+            # Перенос на устройство
+            inputs_for_model = {k: v.to(self.device) for k, v in inputs_for_model.items()}
+            
+            # Предсказание
+            with torch.no_grad():
+                outputs = self.model(**inputs_for_model)
+            
+            # Получение предсказанных меток
+            predictions = torch.argmax(outputs.logits, dim=2)
+            predicted_labels = predictions[0].cpu().numpy()
+            
+            # Выравнивание меток с исходным текстом
+            entities = self._extract_entities_from_predictions(text, predicted_labels, offset_mapping[0])
+            
+            # Замена сущностей в тексте
+            replaced_text = text
+            entity_replacements = []
+            
+            # Сортируем сущности по позиции начала (в обратном порядке для корректной замены)
+            sorted_entities = sorted(entities, key=lambda x: x['start'], reverse=True)
+            
+            for entity in sorted_entities:
+                original_text = entity['text']
+                entity_type = entity['entity']
+                replacement = f"[{entity_type}]"
+                
+                # Заменяем в тексте
+                replaced_text = replaced_text[:entity['start']] + replacement + replaced_text[entity['end']:]
+                
+                entity_replacements.append({
+                    'type': 'ner_replacement',
+                    'entity_type': entity_type,
+                    'original': original_text,
+                    'replacement': replacement,
+                    'position': (entity['start'], entity['end'])
+                })
+            
+            return replaced_text, entity_replacements
         
-        return replaced_text, entity_replacements
+        except Exception as e:
+            print(f"Ошибка при обработке NER: {e}")
+            return text, []
     
     def _extract_entities_from_predictions(self, text: str, predictions: np.ndarray, offset_mapping: torch.Tensor) -> List[Dict]:
         """
@@ -368,8 +406,8 @@ class JSONPreprocessor:
             all_replacements.extend(topic_ner_replacements)
             
             # 3. Затем применяем остальные шаги предобработки к тексту с NER
-            processed_text, text_preprocessing_replacements = self.text_preprocessor.preprocess_text_without_brackets(text_with_ner)
-            processed_topic, topic_preprocessing_replacements = self.text_preprocessor.preprocess_text_without_brackets(topic_with_ner)
+            processed_text, text_preprocessing_replacements = self.text_preprocessor.preprocess_text_after_ner(text_with_ner)
+            processed_topic, topic_preprocessing_replacements = self.text_preprocessor.preprocess_text_after_ner(topic_with_ner)
             
             all_replacements.extend(text_preprocessing_replacements)
             all_replacements.extend(topic_preprocessing_replacements)
@@ -418,11 +456,11 @@ class JSONPreprocessor:
             next_replacement = replacements[i]
             
             # Проверяем, можно ли объединить текущую и следующую замену
-            if (current['step'] == next_replacement['step'] and 
-                current['to'] == next_replacement['from']):
+            if (current.get('type') == next_replacement.get('type') and 
+                current.get('to') == next_replacement.get('from')):
                 # Объединяем
                 current = {
-                    'step': current['step'],
+                    'type': current['type'],
                     'from': current['from'],
                     'to': next_replacement['to']
                 }
@@ -445,7 +483,7 @@ def main():
     
     # Настройки предобработки
     PREPROCESSOR_CONFIG = {
-        "remove_brackets": True,  # Указываем True, но удаление скобок делаем отдельно до NER
+        "remove_brackets": True,
         "to_lower": True,
         "remove_punctuation": True,
         "remove_digits": True,
