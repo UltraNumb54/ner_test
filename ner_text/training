@@ -56,13 +56,15 @@ class NERModelTrainer:
                 print(f"Обнаружена некорректная последовательность в примере {item['id']}")
                 print(f"Текст: {item['original_text'][:100]}...")
                 print(f"Токены: {tokens}")
-                print(f"Метки: {ner_tags}")
+                print(f"Метки до исправления: {ner_tags}")
                 
                 # Исправляем метки (превращаем проблемные I- в O)
                 fixed_tags = self.fix_inconsistent_tags(ner_tags)
                 item['ner_tags'] = fixed_tags
                 valid_data.append(item)
                 invalid_count += 1
+                print(f"Метки после исправления: {fixed_tags}")
+                print("---")
         
         print(f"Исправлено {invalid_count} примеров с некорректными метками")
         return valid_data
@@ -96,7 +98,7 @@ class NERModelTrainer:
     
     def extract_labels_from_data(self, data):
         """
-        Извлечение всех уникальных меток из данных
+        Извлечение всех уникальных меток из данных с дополнительной проверкой
         """
         all_labels = set()
         for item in data:
@@ -109,14 +111,46 @@ class NERModelTrainer:
         
         # Создаем словари для преобразования меток
         labels = ['O'] + sorted_labels
-        self.label2id = {label: idx for idx, label in enumerate(labels)}
-        self.id2label = {idx: label for idx, label in enumerate(labels)}
+        
+        # Убеждаемся, что все метки корректны
+        self.label2id = {}
+        self.id2label = {}
+        
+        for idx, label in enumerate(labels):
+            self.label2id[label] = idx
+            self.id2label[idx] = label
         
         print(f"Найдено {len(labels)} уникальных меток:")
         for label in labels:
             print(f"  {label} -> {self.label2id[label]}")
         
+        # Дополнительная проверка: убедимся, что все метки в данных есть в label2id
+        self.validate_all_labels_in_mapping(data)
+        
         return labels
+    
+    def validate_all_labels_in_mapping(self, data):
+        """
+        Проверяет, что все метки в данных есть в label2id
+        """
+        missing_labels = set()
+        for item in data:
+            for tag in item['ner_tags']:
+                if tag not in self.label2id:
+                    missing_labels.add(tag)
+        
+        if missing_labels:
+            print(f"ВНИМАНИЕ: Найдены метки, отсутствующие в маппинге: {missing_labels}")
+            print("Добавляем отсутствующие метки в маппинг...")
+            
+            # Добавляем отсутствующие метки
+            for label in sorted(missing_labels):
+                new_id = len(self.label2id)
+                self.label2id[label] = new_id
+                self.id2label[new_id] = label
+                print(f"  Добавлена метка: {label} -> {new_id}")
+        
+        return len(missing_labels) == 0
     
     def align_labels_with_tokens(self, labels, word_ids):
         """
@@ -132,16 +166,28 @@ class NERModelTrainer:
             elif word_id != current_word:
                 # Начало нового слова
                 current_word = word_id
-                aligned_labels.append(self.label2id[labels[word_id]])
+                if word_id < len(labels):
+                    aligned_labels.append(self.label2id[labels[word_id]])
+                else:
+                    # Если word_id выходит за границы, используем O
+                    aligned_labels.append(self.label2id['O'])
             else:
                 # Продолжение того же слова (подтокены)
-                label = labels[word_id]
-                # Если это продолжение сущности, используем I- префикс
-                if label.startswith('B-'):
-                    # Преобразуем B- в I- для подтокенов
-                    aligned_labels.append(self.label2id['I-' + label[2:]])
+                if word_id < len(labels):
+                    label = labels[word_id]
+                    # Если это продолжение сущности, используем I- префикс
+                    if label.startswith('B-'):
+                        # Преобразуем B- в I- для подтокенов
+                        i_label = 'I-' + label[2:]
+                        if i_label in self.label2id:
+                            aligned_labels.append(self.label2id[i_label])
+                        else:
+                            # Если I- метки нет, используем O
+                            aligned_labels.append(self.label2id['O'])
+                    else:
+                        aligned_labels.append(self.label2id[label])
                 else:
-                    aligned_labels.append(self.label2id[label])
+                    aligned_labels.append(self.label2id['O'])
         
         return aligned_labels
     
@@ -188,45 +234,83 @@ class NERModelTrainer:
     
     def compute_metrics(self, eval_pred):
         """
-        Исправленная функция вычисления метрик
+        Исправленная функция вычисления метрик с обработкой KeyError
         """
-        metric = evaluate.load("seqeval")
-        
-        predictions, labels = eval_pred
-        
-        # Убеждаемся, что predictions и labels имеют правильную форму
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
-        
-        # Преобразуем предсказания в индексы меток
-        predictions = np.argmax(predictions, axis=2)
-        
-        # Преобразуем в строковые метки
-        true_predictions = []
-        true_labels = []
-        
-        for prediction, label in zip(predictions, labels):
-            pred_sequence = []
-            label_sequence = []
+        try:
+            metric = evaluate.load("seqeval")
             
-            for p, l in zip(prediction, label):
-                # Игнорируем специальные токены (label = -100)
-                if l != -100:
-                    pred_sequence.append(self.id2label[str(p)])
-                    label_sequence.append(self.id2label[str(l)])
+            predictions, labels = eval_pred
             
-            true_predictions.append(pred_sequence)
-            true_labels.append(label_sequence)
+            # Убеждаемся, что predictions и labels имеют правильную форму
+            if isinstance(predictions, tuple):
+                predictions = predictions[0]
+            
+            # Преобразуем предсказания в индексы меток
+            predictions = np.argmax(predictions, axis=2)
+            
+            # Преобразуем в строковые метки
+            true_predictions = []
+            true_labels = []
+            
+            for prediction, label in zip(predictions, labels):
+                pred_sequence = []
+                label_sequence = []
+                
+                for p, l in zip(prediction, label):
+                    # Игнорируем специальные токены (label = -100)
+                    if l != -100:
+                        try:
+                            pred_sequence.append(self.id2label[p])
+                            label_sequence.append(self.id2label[l])
+                        except KeyError as e:
+                            print(f"KeyError: {e}")
+                            print(f"p: {p}, l: {l}")
+                            print(f"Доступные ключи в id2label: {list(self.id2label.keys())}")
+                            # Используем 'O' для неизвестных меток
+                            pred_sequence.append('O')
+                            label_sequence.append('O')
+                
+                true_predictions.append(pred_sequence)
+                true_labels.append(label_sequence)
+            
+            # Вычисляем метрики
+            results = metric.compute(predictions=true_predictions, references=true_labels)
+            
+            return {
+                "precision": results["overall_precision"],
+                "recall": results["overall_recall"],
+                "f1": results["overall_f1"],
+                "accuracy": results["overall_accuracy"],
+            }
+            
+        except Exception as e:
+            print(f"Ошибка в compute_metrics: {e}")
+            return {"f1": 0.0, "precision": 0.0, "recall": 0.0, "accuracy": 0.0}
+    
+    def debug_data_structure(self, data):
+        """
+        Отладочная функция для анализа структуры данных
+        """
+        print("=== ДЕБАГ СТРУКТУРЫ ДАННЫХ ===")
         
-        # Вычисляем метрики
-        results = metric.compute(predictions=true_predictions, references=true_labels)
-        
-        return {
-            "precision": results["overall_precision"],
-            "recall": results["overall_recall"],
-            "f1": results["overall_f1"],
-            "accuracy": results["overall_accuracy"],
-        }
+        # Анализируем первые 3 примера
+        for i, item in enumerate(data[:3]):
+            print(f"Пример {i}:")
+            print(f"  ID: {item['id']}")
+            print(f"  Токены: {item['tokens']}")
+            print(f"  NER теги: {item['ner_tags']}")
+            print(f"  Длина токенов: {len(item['tokens'])}")
+            print(f"  Длина тегов: {len(item['ner_tags'])}")
+            
+            # Проверяем уникальные метки в примере
+            unique_tags = set(item['ner_tags'])
+            print(f"  Уникальные метки: {unique_tags}")
+            
+            # Проверяем, все ли метки есть в label2id
+            missing = [tag for tag in unique_tags if tag not in self.label2id]
+            if missing:
+                print(f"  ОТСУТСТВУЮЩИЕ МЕТКИ: {missing}")
+            print("---")
     
     def train(self, json_file_path, output_dir="./ner_model", train_size=0.8, epochs=3, batch_size=16):
         """
@@ -242,6 +326,9 @@ class NERModelTrainer:
         # Извлечение меток
         print("Извлечение меток...")
         self.extract_labels_from_data(data)
+        
+        # Отладочная информация
+        self.debug_data_structure(data)
         
         # Разделение на train/validation
         train_data, val_data = train_test_split(
@@ -296,7 +383,7 @@ class NERModelTrainer:
             seed=42,
             data_seed=42,
             warmup_steps=500,
-            remove_unused_columns=False,  # Важно для корректной работы
+            remove_unused_columns=False,
         )
         
         # Тренер
@@ -312,7 +399,13 @@ class NERModelTrainer:
         
         # Обучение
         print("Начало обучения...")
-        trainer.train()
+        try:
+            trainer.train()
+        except Exception as e:
+            print(f"Ошибка во время обучения: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
         
         # Сохранение модели
         print("Сохранение модели...")
@@ -331,10 +424,13 @@ class NERModelTrainer:
         
         # Финальная оценка
         print("Финальная оценка...")
-        eval_results = trainer.evaluate()
-        print("Результаты оценки:")
-        for key, value in eval_results.items():
-            print(f"  {key}: {value:.4f}")
+        try:
+            eval_results = trainer.evaluate()
+            print("Результаты оценки:")
+            for key, value in eval_results.items():
+                print(f"  {key}: {value:.4f}")
+        except Exception as e:
+            print(f"Ошибка при оценке: {e}")
         
         return trainer
 
@@ -358,14 +454,18 @@ def main():
     )
     
     try:
-        trainer.train(
+        result = trainer.train(
             json_file_path=JSON_FILE_PATH,
             output_dir=OUTPUT_DIR,
             epochs=3,
             batch_size=16,
             train_size=0.8
         )
-        print("Обучение завершено успешно!")
+        
+        if result is not None:
+            print("Обучение завершено успешно!")
+        else:
+            print("Обучение завершилось с ошибками!")
         
     except Exception as e:
         print(f"Ошибка при обучении: {e}")
