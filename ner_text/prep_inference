@@ -6,6 +6,7 @@ import os
 import torch
 from transformers import AutoTokenizer, AutoModelForTokenClassification
 import pymorphy3  # для лемматизации русского языка
+import numpy as np
 
 class TextPreprocessor:
     def __init__(self, 
@@ -313,7 +314,7 @@ class NERTextProcessor:
                     'entity_type': entity_type,
                     'original': original_text,
                     'replacement': replacement,
-                    'position': (entity['start'], entity['end'])
+                    'position': (int(entity['start']), int(entity['end']))  # Преобразуем в int
                 })
             
             return replaced_text, entity_replacements
@@ -346,15 +347,15 @@ class NERTextProcessor:
                 current_entity = {
                     'entity': label[2:],
                     'text': text[offset[0]:offset[1]],
-                    'start': offset[0],
-                    'end': offset[1]
+                    'start': int(offset[0]),  # Преобразуем в int
+                    'end': int(offset[1])     # Преобразуем в int
                 }
             elif label.startswith('I-'):
                 # Продолжение сущности
                 if current_entity is not None and label[2:] == current_entity['entity']:
                     # Расширяем текущую сущность
                     current_entity['text'] = text[current_entity['start']:offset[1]]
-                    current_entity['end'] = offset[1]
+                    current_entity['end'] = int(offset[1])  # Преобразуем в int
                 else:
                     # Некорректная I- метка, начинаем новую сущность
                     if current_entity is not None:
@@ -362,8 +363,8 @@ class NERTextProcessor:
                     current_entity = {
                         'entity': label[2:],
                         'text': text[offset[0]:offset[1]],
-                        'start': offset[0],
-                        'end': offset[1]
+                        'start': int(offset[0]),  # Преобразуем в int
+                        'end': int(offset[1])     # Преобразуем в int
                     }
             else:
                 # Конец сущности (метка 'O')
@@ -381,6 +382,33 @@ class JSONPreprocessor:
     def __init__(self, model_path: str, preprocessor_config: Dict):
         self.ner_processor = NERTextProcessor(model_path)
         self.text_preprocessor = TextPreprocessor(**preprocessor_config)
+    
+    def convert_to_serializable(self, obj):
+        """
+        Рекурсивно преобразует объекты в сериализуемые для JSON
+        """
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, torch.Tensor):
+            return obj.cpu().numpy().tolist()
+        elif isinstance(obj, dict):
+            return {key: self.convert_to_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self.convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self.convert_to_serializable(item) for item in obj)
+        elif obj is None or isinstance(obj, (str, int, float, bool)):
+            return obj
+        else:
+            # Для неизвестных типов пытаемся преобразовать в строку
+            try:
+                return str(obj)
+            except:
+                return None
     
     def process_json_file(self, input_file: str, output_file1: str, output_file2: str):
         """
@@ -438,20 +466,45 @@ class JSONPreprocessor:
             })
             
             # Формируем запись для второго файла
+            attachments_count = item.get('metadata', {}).get('attachments_count', 0)
+            # Преобразуем в int если это numpy тип
+            if hasattr(attachments_count, 'item'):
+                attachments_count = attachments_count.item()
+            elif isinstance(attachments_count, (np.integer, np.int32, np.int64)):
+                attachments_count = int(attachments_count)
+            
             result2.append({
                 "id": item.get('id', ''),
                 "service": item.get('metadata', {}).get('service', ''),
                 "topic": processed_topic,
                 "text": processed_text,
-                "attachments": item.get('metadata', {}).get('attachments_count', 0)
+                "attachments": attachments_count
             })
         
-        # Сохраняем результаты
-        with open(output_file1, 'w', encoding='utf-8') as f:
-            json.dump(result1, f, ensure_ascii=False, indent=2)
+        # Преобразуем результаты в сериализуемый формат
+        result1 = self.convert_to_serializable(result1)
+        result2 = self.convert_to_serializable(result2)
         
+        # Сохраняем результаты с обработкой numpy типов
+        def json_serializer(obj):
+            """Кастомный сериализатор для JSON"""
+            if isinstance(obj, (np.integer, np.int32, np.int64)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, torch.Tensor):
+                return obj.cpu().numpy().tolist()
+            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+        
+        # Сохраняем первый файл
+        with open(output_file1, 'w', encoding='utf-8') as f:
+            json.dump(result1, f, ensure_ascii=False, indent=2, default=json_serializer)
+        
+        # Сохраняем второй файл
         with open(output_file2, 'w', encoding='utf-8') as f:
-            json.dump(result2, f, ensure_ascii=False, indent=2)
+            json.dump(result2, f, ensure_ascii=False, indent=2, default=json_serializer)
         
         print(f"Созданы файлы: {output_file1} и {output_file2}")
         print(f"Обработано записей: {len(data)}")
