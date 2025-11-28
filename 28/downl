@@ -1,30 +1,21 @@
-from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer, AutoModelForTokenClassification
-import os
+from transformers import AutoModelForTokenClassification, AutoTokenizer
 
-# Явно скачиваем модель в указанную директорию
-model_name = "bert-base-multilingual-cased"
-local_dir = "./bert-base-multilingual-cased"
+# Укажите правильный путь к папке с моделью
+model_path = "/путь/к/вашей/модели/bert-base-multilingual-cased"
 
-print(f"Скачивание модели {model_name}...")
+# Загрузка с использованием только локальных файлов
 try:
-    # Скачиваем все файлы модели
-    snapshot_download(
-        repo_id=model_name,
-        local_dir=local_dir,
-        local_dir_use_symlinks=False,  # избегаем симлинков
-        force_download=True,  # принудительно перезаписываем
-        resume_download=False
-    )
-    print(f"Модель успешно скачана в {local_dir}")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+    model = AutoModelForTokenClassification.from_pretrained(model_path, local_files_only=True)
+    print("Модель и токенизатор успешно загружены локально")
 except Exception as e:
-    print(f"Ошибка при скачивании: {e}")
+    print(f"Ошибка при загрузке локальных файлов: {e}")
 
-# Проверяем загрузку
-print("Проверка загрузки...")
+
 try:
-    tokenizer = AutoTokenizer.from_pretrained(local_dir)
-    model = AutoModelForTokenClassification.from_pretrained(local_dir)
-    print("✅ Модель и токенизатор успешно загружены локально")
+    # Попытка загрузить модель из стандартного кэша
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
+    model = AutoModelForTokenClassification.from_pretrained("bert-base-multilingual-cased")
+    print("Модель присутствует в кэше.")
 except Exception as e:
-    print(f"❌ Ошибка при проверке: {e}")
+    print(f"Модель не найдена в кэше. Ошибка: {e}")
