@@ -1,0 +1,743 @@
+import json
+import re
+import string
+from typing import List, Dict, Any, Tuple
+import os
+import torch
+from transformers import AutoTokenizer, AutoModelForTokenClassification
+import pymorphy3  # для лемматизации русского языка
+import numpy as np
+
+class TextPreprocessor:
+    def __init__(self, 
+                 remove_brackets: bool = True,
+                 to_lower: bool = True,
+                 remove_punctuation: bool = True,
+                 remove_digits: bool = True,
+                 remove_stopwords: bool = True,
+                 lemmatize: bool = False,
+                 protect_ner_tags: bool = True):  # Новый параметр для защиты NER меток
+        
+        self.remove_brackets = remove_brackets
+        self.to_lower = to_lower
+        self.remove_punctuation = remove_punctuation
+        self.remove_digits = remove_digits
+        self.remove_stopwords = remove_stopwords
+        self.lemmatize = lemmatize
+        self.protect_ner_tags = protect_ner_tags
+        
+        # Базовый список стоп-слов для русского языка
+        self.stopwords = set([
+            'и', 'в', 'во', 'не', 'что', 'он', 'на', 'я', 'с', 'со', 'как', 'а', 'то', 'все', 'она', 'так', 'его', 
+            'но', 'да', 'ты', 'к', 'у', 'же', 'вы', 'за', 'бы', 'по', 'только', 'ее', 'мне', 'было', 'вот', 'от', 
+            'меня', 'еще', 'нет', 'о', 'из', 'ему', 'теперь', 'когда', 'даже', 'ну', 'вдруг', 'ли', 'если', 'уже', 
+            'или', 'ни', 'быть', 'был', 'него', 'до', 'вас', 'нибудь', 'опять', 'уж', 'вам', 'ведь', 'там', 'потом', 
+            'себя', 'ничего', 'ей', 'может', 'они', 'тут', 'где', 'есть', 'надо', 'ней', 'для', 'мы', 'тебя', 'их', 
+            'чем', 'была', 'сам', 'чтоб', 'без', 'будто', 'чего', 'раз', 'тоже', 'себе', 'под', 'будет', 'ж', 'тогда', 
+            'кто', 'этот', 'того', 'потому', 'этого', 'какой', 'совсем', 'ним', 'здесь', 'этом', 'один', 'почти', 
+            'мой', 'тем', 'чтобы', 'нее', 'сейчас', 'были', 'куда', 'зачем', 'всех', 'никогда', 'можно', 'при', 'наконец', 
+            'два', 'об', 'другой', 'хоть', 'после', 'над', 'больше', 'тот', 'через', 'эти', 'нас', 'про', 'всего', 
+            'них', 'какая', 'много', 'разве', 'три', 'эту', 'моя', 'впрочем', 'хорошо', 'свою', 'этой', 'перед', 'иногда', 
+            'лучше', 'чуть', 'том', 'нельзя', 'такой', 'им', 'более', 'всегда', 'конечно', 'всю', 'между'
+        ])
+        
+        # Инициализация лемматизатора
+        if self.lemmatize:
+            self.morph = pymorphy3.MorphAnalyzer()
+    
+    def protect_ner_tags_in_text(self, text: str) -> Tuple[str, Dict[str, str]]:
+        """
+        Защищает NER теги от обработки, заменяя их временными плейсхолдерами
+        """
+        if not self.protect_ner_tags:
+            return text, {}
+        
+        # Ищем все NER теги в тексте
+        ner_tags = re.findall(r'\[([A-Z_]+)\]', text)
+        protected_tags = {}
+        protected_text = text
+        
+        for i, tag in enumerate(ner_tags):
+            placeholder = f"__NER_{i}__"
+            protected_tags[placeholder] = f"[{tag}]"
+            protected_text = protected_text.replace(f"[{tag}]", placeholder)
+        
+        return protected_text, protected_tags
+    
+    def restore_ner_tags(self, text: str, protected_tags: Dict[str, str]) -> str:
+        """
+        Восстанавливает NER теги из плейсхолдеров
+        """
+        if not self.protect_ner_tags:
+            return text
+        
+        restored_text = text
+        for placeholder, original_tag in protected_tags.items():
+            restored_text = restored_text.replace(placeholder, original_tag)
+        
+        return restored_text
+    
+    def remove_bracket_content(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Удаление всего в [], {}, <> включая сами скобки
+        Но защищаем NER теги если protect_ner_tags=True
+        """
+        original_text = text
+        
+        # Защищаем NER теги
+        protected_text, protected_tags = self.protect_ner_tags_in_text(text)
+        
+        # Удаляем содержимое в квадратных скобках (кроме защищенных)
+        protected_text = re.sub(r'\[.*?\]', '', protected_text)
+        # Удаляем содержимое в фигурных скобках
+        protected_text = re.sub(r'\{.*?\}', '', protected_text)
+        # Удаляем содержимое в угловых скобках
+        protected_text = re.sub(r'\<.*?\>', '', protected_text)
+        
+        # Восстанавливаем NER теги
+        text = self.restore_ner_tags(protected_text, protected_tags)
+        
+        # Убираем лишние пробелы после удаления
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'remove_brackets',
+                'from_text': original_text,
+                'to_text': text
+            })
+        
+        return text, replacements
+    
+    def remove_punctuation_and_special(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Замена всей пунктуации и спецсимволов на пробел
+        Защищаем NER теги если protect_ner_tags=True
+        """
+        original_text = text
+        
+        # Защищаем NER теги
+        protected_text, protected_tags = self.protect_ner_tags_in_text(text)
+        
+        # Создаем таблицу переводов для замены пунктуации на пробелы
+        translator = str.maketrans(string.punctuation + '«»—…', ' ' * (len(string.punctuation) + 4))
+        protected_text = protected_text.translate(translator)
+        
+        # Восстанавливаем NER теги
+        text = self.restore_ner_tags(protected_text, protected_tags)
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'remove_punctuation',
+                'from_text': original_text,
+                'to_text': text
+            })
+        
+        return text, replacements
+    
+    def remove_digits_from_text(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Удаление цифр из текста
+        Защищаем NER теги если protect_ner_tags=True
+        """
+        original_text = text
+        
+        # Защищаем NER теги
+        protected_text, protected_tags = self.protect_ner_tags_in_text(text)
+        
+        # Удаляем цифры
+        protected_text = re.sub(r'\d+', '', protected_text)
+        
+        # Восстанавливаем NER теги
+        text = self.restore_ner_tags(protected_text, protected_tags)
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'remove_digits',
+                'from_text': original_text,
+                'to_text': text
+            })
+        
+        return text, replacements
+    
+    def remove_stopwords_from_text(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Удаление стоп-слов из текста
+        """
+        original_text = text
+        words = text.split()
+        filtered_words = [word for word in words if word.lower() not in self.stopwords]
+        text = ' '.join(filtered_words)
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'remove_stopwords',
+                'from_text': original_text,
+                'to_text': text
+            })
+        
+        return text, replacements
+    
+    def lemmatize_text(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Приведение слов к начальной форме (лемматизация)
+        """
+        if not hasattr(self, 'morph'):
+            return text, []
+        
+        original_text = text
+        words = text.split()
+        lemmatized_words = []
+        
+        for word in words:
+            parsed = self.morph.parse(word)[0]
+            lemmatized_words.append(parsed.normal_form)
+        
+        text = ' '.join(lemmatized_words)
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'lemmatize',
+                'from_text': original_text,
+                'to_text': text
+            })
+        
+        return text, replacements
+    
+    def to_lower_case(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Приведение текста к нижнему регистру
+        Защищаем NER теги если protect_ner_tags=True
+        """
+        original_text = text
+        
+        # Защищаем NER теги
+        protected_text, protected_tags = self.protect_ner_tags_in_text(text)
+        
+        # Приводим к нижнему регистру
+        protected_text = protected_text.lower()
+        
+        # Восстанавливаем NER теги
+        text = self.restore_ner_tags(protected_text, protected_tags)
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'to_lower',
+                'from_text': original_text,
+                'to_text': text
+            })
+        
+        return text, replacements
+    
+    def collapse_spaces(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Замена нескольких подряд идущих пробелов на один
+        """
+        original_text = text
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'collapse_spaces',
+                'from_text': original_text,
+                'to_text': text
+            })
+        
+        return text, replacements
+    
+    def remove_specific_entities(self, text: str, entities_to_remove: List[str] = None) -> Tuple[str, List[Dict]]:
+        """
+        Удаление конкретных сущностей из текста (например, AGM, AMG2)
+        """
+        if entities_to_remove is None:
+            entities_to_remove = ['AGM', 'AMG2']
+        
+        original_text = text
+        
+        for entity in entities_to_remove:
+            text = re.sub(r'\s*\[' + re.escape(entity) + r'\]\s*', ' ', text)
+        
+        # Убираем лишние пробелы
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'remove_specific_entities',
+                'from_text': original_text,
+                'to_text': text,
+                'removed_entities': entities_to_remove
+            })
+        
+        return text, replacements
+    
+    def merge_duplicate_entities(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Объединение повторяющихся сущностей подряд (например, [AGM][AGM] -> [AGM])
+        """
+        original_text = text
+        
+        # Находим и объединяем повторяющиеся сущности
+        pattern = r'(\[[A-Z_]+\])(?:\s*\1)+'
+        text = re.sub(pattern, r'\1', text)
+        
+        replacements = []
+        if text != original_text:
+            replacements.append({
+                'type': 'merge_duplicate_entities',
+                'from_text': original_text,
+                'to_text': text
+            })
+        
+        return text, replacements
+    
+    def preprocess_text_after_ner(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Полная предобработка текста ПОСЛЕ применения NER с защитой тегов
+        """
+        current_text = text
+        all_replacements = []
+        
+        # 0. Объединяем дублирующиеся сущности
+        current_text, replacements = self.merge_duplicate_entities(current_text)
+        all_replacements.extend(replacements)
+        
+        # 1. Удаляем конкретные сущности (AGM, AMG2)
+        current_text, replacements = self.remove_specific_entities(current_text)
+        all_replacements.extend(replacements)
+        
+        # 2. Приведение к нижнему регистру (с защитой NER тегов)
+        if self.to_lower:
+            current_text, replacements = self.to_lower_case(current_text)
+            all_replacements.extend(replacements)
+        
+        # 3. Замена пунктуации и спецсимволов на пробел (с защитой NER тегов)
+        if self.remove_punctuation:
+            current_text, replacements = self.remove_punctuation_and_special(current_text)
+            all_replacements.extend(replacements)
+        
+        # 4. Удаление цифр (с защитой NER тегов)
+        if self.remove_digits:
+            current_text, replacements = self.remove_digits_from_text(current_text)
+            all_replacements.extend(replacements)
+        
+        # 5. Удаление стоп-слов
+        if self.remove_stopwords:
+            current_text, replacements = self.remove_stopwords_from_text(current_text)
+            all_replacements.extend(replacements)
+        
+        # 6. Лемматизация
+        if self.lemmatize:
+            current_text, replacements = self.lemmatize_text(current_text)
+            all_replacements.extend(replacements)
+        
+        # 7. Удаление лишних пробелов (всегда применяется)
+        current_text, replacements = self.collapse_spaces(current_text)
+        all_replacements.extend(replacements)
+        
+        return current_text, all_replacements
+
+class NERTextProcessor:
+    def __init__(self, model_path: str):
+        """
+        Инициализация NER модели для обработки текста
+        """
+        # Очистка кэша и принудительное использование локальных файлов
+        self.clear_transformers_cache()
+        
+        # Явно указываем использование локальной модели
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=True,
+            trust_remote_code=False
+        )
+        self.model = AutoModelForTokenClassification.from_pretrained(
+            model_path,
+            local_files_only=True,
+            trust_remote_code=False
+        )
+        
+        # Загрузка информации о метках
+        with open(f"{model_path}/label_info.json", 'r', encoding='utf-8') as f:
+            label_info = json.load(f)
+            self.id2label = label_info['id2label']
+        
+        # Словарь перевода меток с английского на русский
+        self.entity_translation = {
+            'PER': 'ПЕРСОНА',
+            'LOC': 'ЛОКАЦИЯ', 
+            'ORG': 'ОРГАНИЗАЦИЯ',
+            'DATE': 'ДАТА',
+            'TIME': 'ВРЕМЯ',
+            'MISC': 'ПРОЧЕЕ',
+            'AGM': 'АГМ',
+            'AMG2': 'АМГ2'
+            # Добавьте другие метки по необходимости
+        }
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Используется устройство: {self.device}")
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Гарантируем, что данные не отправляются
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+        os.environ['HF_DATASETS_OFFLINE'] = '1'
+    
+    def clear_transformers_cache(self):
+        """
+        Очистка кэша transformers для устранения проблем с Mistral
+        """
+        try:
+            from transformers.utils.hub import TRANSFORMERS_CACHE
+            import shutil
+            if os.path.exists(TRANSFORMERS_CACHE):
+                print("Очистка кэша transformers...")
+                shutil.rmtree(TRANSFORMERS_CACHE)
+        except:
+            pass  # Игнорируем ошибки очистки кэша
+    
+    def translate_entity(self, entity_type: str) -> str:
+        """
+        Перевод названия сущности с английского на русский
+        """
+        return self.entity_translation.get(entity_type, entity_type)
+    
+    def replace_entities(self, text: str) -> Tuple[str, List[Dict]]:
+        """
+        Замена сущностей в тексте с помощью NER модели
+        """
+        if not text or text.strip() == "":
+            return text, []
+        
+        try:
+            # Токенизация текста для BERT
+            inputs = self.tokenizer(
+                text,
+                return_offsets_mapping=True,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt"
+            )
+            
+            # Извлекаем offset_mapping отдельно
+            offset_mapping = inputs['offset_mapping']
+            
+            # Удаляем offset_mapping из inputs для модели
+            inputs_for_model = {k: v for k, v in inputs.items() if k != 'offset_mapping'}
+            
+            # Перенос на устройство
+            inputs_for_model = {k: v.to(self.device) for k, v in inputs_for_model.items()}
+            
+            # Предсказание
+            with torch.no_grad():
+                outputs = self.model(**inputs_for_model)
+            
+            # Получение предсказанных меток
+            predictions = torch.argmax(outputs.logits, dim=2)
+            predicted_labels = predictions[0].cpu().numpy()
+            
+            # Выравнивание меток с исходным текстом
+            entities = self._extract_entities_from_predictions(text, predicted_labels, offset_mapping[0])
+            
+            # Замена сущностей в тексте
+            replaced_text = text
+            entity_replacements = []
+            
+            # Сортируем сущности по позиции начала (в обратном порядке для корректной замены)
+            sorted_entities = sorted(entities, key=lambda x: x['start'], reverse=True)
+            
+            for entity in sorted_entities:
+                original_text = entity['text']
+                entity_type = entity['entity']
+                # Переводим название сущности на русский
+                translated_entity = self.translate_entity(entity_type)
+                replacement = f"[{translated_entity}]"
+                
+                # Заменяем в тексте
+                replaced_text = replaced_text[:entity['start']] + replacement + replaced_text[entity['end']:]
+                
+                entity_replacements.append({
+                    'type': 'ner_replacement',
+                    'entity_type': entity_type,
+                    'translated_entity_type': translated_entity,
+                    'original': original_text,
+                    'replacement': replacement,
+                    'position': (int(entity['start']), int(entity['end']))
+                })
+            
+            return replaced_text, entity_replacements
+        
+        except Exception as e:
+            print(f"Ошибка при обработке NER: {e}")
+            return text, []
+    
+    def _extract_entities_from_predictions(self, text: str, predictions: np.ndarray, offset_mapping: torch.Tensor) -> List[Dict]:
+        """
+        Извлечение сущностей из предсказаний модели
+        """
+        entities = []
+        current_entity = None
+        
+        offset_mapping = offset_mapping.cpu().numpy()
+        
+        for i, (pred_idx, offset) in enumerate(zip(predictions, offset_mapping)):
+            # Пропускаем специальные токены
+            if offset[0] == offset[1] == 0:
+                continue
+            
+            label = self.id2label[str(pred_idx)]
+            
+            if label.startswith('B-'):
+                # Начало новой сущности
+                if current_entity is not None:
+                    entities.append(current_entity)
+                
+                current_entity = {
+                    'entity': label[2:],
+                    'text': text[offset[0]:offset[1]],
+                    'start': int(offset[0]),
+                    'end': int(offset[1])
+                }
+            elif label.startswith('I-'):
+                # Продолжение сущности
+                if current_entity is not None and label[2:] == current_entity['entity']:
+                    # Расширяем текущую сущность
+                    current_entity['text'] = text[current_entity['start']:offset[1]]
+                    current_entity['end'] = int(offset[1])
+                else:
+                    # Некорректная I- метка, начинаем новую сущность
+                    if current_entity is not None:
+                        entities.append(current_entity)
+                    current_entity = {
+                        'entity': label[2:],
+                        'text': text[offset[0]:offset[1]],
+                        'start': int(offset[0]),
+                        'end': int(offset[1])
+                    }
+            else:
+                # Конец сущности (метка 'O')
+                if current_entity is not None:
+                    entities.append(current_entity)
+                    current_entity = None
+        
+        # Добавляем последнюю сущность
+        if current_entity is not None:
+            entities.append(current_entity)
+        
+        return entities
+
+class JSONPreprocessor:
+    def __init__(self, model_path: str, preprocessor_config: Dict):
+        self.ner_processor = NERTextProcessor(model_path)
+        # Добавляем защиту NER тегов в конфиг
+        preprocessor_config['protect_ner_tags'] = True
+        self.text_preprocessor = TextPreprocessor(**preprocessor_config)
+    
+    def convert_to_serializable(self, obj):
+        """
+        Рекурсивно преобразует объекты в сериализуемые для JSON
+        """
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, torch.Tensor):
+            return obj.cpu().numpy().tolist()
+        elif isinstance(obj, dict):
+            return {key: self.convert_to_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self.convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self.convert_to_serializable(item) for item in obj)
+        elif obj is None or isinstance(obj, (str, int, float, bool)):
+            return obj
+        else:
+            try:
+                return str(obj)
+            except:
+                return None
+    
+    def process_json_file(self, input_file: str, output_file1: str, output_file2: str):
+        """
+        Обработка JSON файла и создание двух выходных файлов
+        """
+        # Загрузка данных
+        with open(input_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        result1 = []  # Для первого файла: оригинальный текст, обработанный текст, замены (только NER)
+        result2 = []  # Для второго файла: id, service, topic, текст, attachments
+        
+        print(f"Начата обработка {len(data)} записей...")
+        
+        for i, item in enumerate(data):
+            if i % 10 == 0:
+                print(f"Обработано {i}/{len(data)} записей...")
+            
+            # Обработка основного текста
+            original_text = item.get('original_text', '')
+            topic = item.get('metadata', {}).get('topic', '')
+            
+            all_replacements = []
+            
+            # 1. Сначала удаляем скобки из текста и topic
+            text_after_brackets, text_bracket_replacements = self.text_preprocessor.remove_bracket_content(original_text)
+            topic_after_brackets, topic_bracket_replacements = self.text_preprocessor.remove_bracket_content(topic)
+            
+            all_replacements.extend(text_bracket_replacements)
+            all_replacements.extend(topic_bracket_replacements)
+            
+            # 2. Затем применяем NER к тексту после удаления скобок
+            text_with_ner, text_ner_replacements = self.ner_processor.replace_entities(text_after_brackets)
+            topic_with_ner, topic_ner_replacements = self.ner_processor.replace_entities(topic_after_brackets)
+            
+            all_replacements.extend(text_ner_replacements)
+            all_replacements.extend(topic_ner_replacements)
+            
+            # 3. Затем применяем остальные шаги предобработки к тексту с NER
+            processed_text, text_preprocessing_replacements = self.text_preprocessor.preprocess_text_after_ner(text_with_ner)
+            processed_topic, topic_preprocessing_replacements = self.text_preprocessor.preprocess_text_after_ner(topic_with_ner)
+            
+            all_replacements.extend(text_preprocessing_replacements)
+            all_replacements.extend(topic_preprocessing_replacements)
+            
+            # Фильтруем замены - оставляем только NER замены для result1
+            ner_replacements = [r for r in all_replacements if r.get('type') == 'ner_replacement']
+            
+            # Объединяем последовательные NER замены
+            merged_ner_replacements = self._merge_consecutive_ner_replacements(ner_replacements)
+            
+            # Формируем запись для первого файла (только NER замены)
+            result1.append({
+                "id": item.get('id', ''),
+                "original_text": original_text,
+                "processed_text": processed_text,
+                "replacements": merged_ner_replacements
+            })
+            
+            # Формируем запись для второго файла
+            attachments_count = item.get('metadata', {}).get('attachments_count', 0)
+            if hasattr(attachments_count, 'item'):
+                attachments_count = attachments_count.item()
+            elif isinstance(attachments_count, (np.integer, np.int32, np.int64)):
+                attachments_count = int(attachments_count)
+            
+            result2.append({
+                "id": item.get('id', ''),
+                "service": item.get('metadata', {}).get('service', ''),
+                "topic": processed_topic,
+                "text": processed_text,
+                "attachments": attachments_count
+            })
+        
+        # Преобразуем результаты в сериализуемый формат
+        result1 = self.convert_to_serializable(result1)
+        result2 = self.convert_to_serializable(result2)
+        
+        # Сохраняем результаты с обработкой numpy типов
+        def json_serializer(obj):
+            """Кастомный сериализатор для JSON"""
+            if isinstance(obj, (np.integer, np.int32, np.int64)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, torch.Tensor):
+                return obj.cpu().numpy().tolist()
+            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+        
+        # Сохраняем первый файл
+        with open(output_file1, 'w', encoding='utf-8') as f:
+            json.dump(result1, f, ensure_ascii=False, indent=2, default=json_serializer)
+        
+        # Сохраняем второй файл
+        with open(output_file2, 'w', encoding='utf-8') as f:
+            json.dump(result2, f, ensure_ascii=False, indent=2, default=json_serializer)
+        
+        print(f"Созданы файлы: {output_file1} и {output_file2}")
+        print(f"Обработано записей: {len(data)}")
+    
+    def _merge_consecutive_ner_replacements(self, replacements: List[Dict]) -> List[Dict]:
+        """
+        Объединение последовательных одинаковых NER замен
+        """
+        if not replacements:
+            return []
+        
+        merged = []
+        current = None
+        
+        for replacement in replacements:
+            if current is None:
+                current = replacement
+            else:
+                # Проверяем, можно ли объединить с текущей заменой
+                if (current.get('entity_type') == replacement.get('entity_type') and
+                    current.get('replacement') == replacement.get('replacement') and
+                    current.get('position')[1] == replacement.get('position')[0]):
+                    # Объединяем замены
+                    current['original'] += ' ' + replacement['original']
+                    current['position'] = (current['position'][0], replacement['position'][1])
+                else:
+                    merged.append(current)
+                    current = replacement
+        
+        if current is not None:
+            merged.append(current)
+        
+        return merged
+
+def main():
+    """
+    Пример использования
+    """
+    # Конфигурация
+    INPUT_JSON_FILE = "inference_data.json"  # Входной JSON файл
+    MODEL_PATH = "./trained_ner_model"  # Путь к обученной модели
+    OUTPUT_FILE1 = "processed_with_replacements.json"  # Первый выходной файл
+    OUTPUT_FILE2 = "clean_data.json"  # Второй выходной файл
+    
+    # Настройки предобработки
+    PREPROCESSOR_CONFIG = {
+        "remove_brackets": True,
+        "to_lower": True,
+        "remove_punctuation": True,
+        "remove_digits": True,
+        "remove_stopwords": True,
+        "lemmatize": False  # Меняйте на True если нужно лемматизировать
+    }
+    
+    # Проверка существования файлов
+    if not os.path.exists(INPUT_JSON_FILE):
+        print(f"Ошибка: файл {INPUT_JSON_FILE} не найден!")
+        return
+    
+    if not os.path.exists(MODEL_PATH):
+        print(f"Ошибка: модель {MODEL_PATH} не найдена!")
+        return
+    
+    try:
+        # Создаем процессор и обрабатываем данные
+        processor = JSONPreprocessor(MODEL_PATH, PREPROCESSOR_CONFIG)
+        processor.process_json_file(INPUT_JSON_FILE, OUTPUT_FILE1, OUTPUT_FILE2)
+        print("Обработка завершена успешно!")
+        
+    except Exception as e:
+        print(f"Ошибка при обработке: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
