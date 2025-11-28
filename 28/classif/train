@@ -2,8 +2,8 @@ import json
 import torch
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import classification_report, accuracy_score, f1_score
 from transformers import (
     AutoTokenizer, 
     AutoModelForSequenceClassification,
@@ -11,10 +11,75 @@ from transformers import (
     Trainer,
     EarlyStoppingCallback
 )
-from datasets import Dataset, ClassLabel
+from datasets import Dataset
 import evaluate
 import os
 from collections import Counter
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Any, Optional
+
+def analyze_dataset_statistics(json_file_path):
+    """
+    Анализ статистики датасета: распределение service
+    """
+    print("=== АНАЛИЗ СТАТИСТИКИ ДАТАСЕТА ===")
+    
+    # Загрузка данных
+    with open(json_file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    print(f"Общее количество записей: {len(data)}")
+    
+    # Сбор статистики по service
+    service_stats = Counter()
+    
+    for item in data:
+        # Исправляем KeyError: проверяем разные возможные пути к service
+        service = None
+        if 'metadata' in item and 'service' in item['metadata']:
+            service = item['metadata']['service']
+        elif 'service' in item:
+            service = item['service']
+        elif 'label' in item:
+            service = item['label']
+        else:
+            # Попробуем найти service в других полях
+            for key in item.keys():
+                if 'service' in key.lower():
+                    service = item[key]
+                    break
+        
+        if service is None:
+            service = 'unknown'
+        
+        service_stats[service] += 1
+    
+    # Вывод статистики
+    print(f"\nСтатистика по service:")
+    print("-" * 50)
+    print(f"{'Service':<30} {'Count':<10} {'Percentage':<10}")
+    print("-" * 50)
+    
+    total_count = len(data)
+    for service, count in service_stats.most_common():
+        percentage = (count / total_count) * 100
+        print(f"{service:<30} {count:<10} {percentage:.1f}%")
+    
+    # Визуализация
+    plt.figure(figsize=(12, 6))
+    services, counts = zip(*service_stats.most_common())
+    
+    plt.bar(services, counts, color='skyblue')
+    plt.title('Распределение записей по service')
+    plt.xlabel('Service')
+    plt.ylabel('Количество записей')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.savefig('service_distribution.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    return dict(service_stats), data
 
 class TextClassifierTrainer:
     def __init__(self, model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
@@ -27,8 +92,45 @@ class TextClassifierTrainer:
         self.label2id = {}
         self.id2label = {}
         
-    def load_and_prepare_data(self, json_file_path, text_field="original_text", 
-                            service_field="metadata.service", attachments_field="metadata.attachments_count"):
+    def extract_service_from_item(self, item):
+        """
+        Безопасное извлечение service из элемента данных
+        """
+        # Проверяем разные возможные пути к service
+        if 'metadata' in item and isinstance(item['metadata'], dict) and 'service' in item['metadata']:
+            return item['metadata']['service']
+        elif 'service' in item:
+            return item['service']
+        elif 'label' in item:
+            return item['label']
+        else:
+            # Ищем поле, содержащее 'service' в названии
+            for key in item.keys():
+                if 'service' in key.lower():
+                    return item[key]
+            return 'unknown'
+    
+    def extract_text_from_item(self, item):
+        """
+        Безопасное извлечение текста из элемента данных
+        """
+        # Проверяем разные возможные пути к тексту
+        text_fields = ['original_text', 'text', 'content', 'message', 'description']
+        
+        for field in text_fields:
+            if field in item and item[field]:
+                text = item[field]
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+        
+        # Если не нашли в стандартных полях, ищем любое строковое поле
+        for key, value in item.items():
+            if isinstance(value, str) and value.strip() and len(value) > 10:
+                return value.strip()
+        
+        return ''
+    
+    def load_and_prepare_data(self, json_file_path):
         """
         Загрузка и подготовка данных для обучения
         """
@@ -36,21 +138,34 @@ class TextClassifierTrainer:
         with open(json_file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        # Фильтрация данных: только записи без attachments
+        # Подготовка данных
         filtered_data = []
-        for item in data:
-            attachments = item.get('metadata', {}).get('attachments_count', 0)
-            if attachments == 0:  # Только без attachments
-                service = item.get('metadata', {}).get('service')
-                text = item.get(text_field, '')
-                
-                if service and text and text.strip():
-                    filtered_data.append({
-                        'text': text.strip(),
-                        'service': service
-                    })
+        missing_service = 0
+        missing_text = 0
         
-        print(f"Загружено {len(filtered_data)} записей без attachments")
+        for item in data:
+            service = self.extract_service_from_item(item)
+            text = self.extract_text_from_item(item)
+            
+            if service == 'unknown':
+                missing_service += 1
+                continue
+                
+            if not text:
+                missing_text += 1
+                continue
+            
+            filtered_data.append({
+                'text': text,
+                'service': service
+            })
+        
+        print(f"Загружено {len(filtered_data)} записей")
+        print(f"Пропущено из-за отсутствия service: {missing_service}")
+        print(f"Пропущено из-за отсутствия текста: {missing_text}")
+        
+        if len(filtered_data) == 0:
+            raise ValueError("Нет данных для обучения после фильтрации!")
         
         # Создание DataFrame
         df = pd.DataFrame(filtered_data)
@@ -73,7 +188,7 @@ class TextClassifierTrainer:
         
         return df
     
-    def balance_dataset(self, df, min_samples_per_class=10):
+    def balance_dataset(self, df, min_samples_per_class=5):
         """
         Балансировка датасета (upsampling для миноритарных классов)
         """
@@ -87,20 +202,20 @@ class TextClassifierTrainer:
         
         # Upsampling миноритарных классов
         balanced_dfs = []
-        max_samples = class_counts.max()
         
         for label in class_counts.index:
             class_df = df[df['label'] == label]
             current_count = len(class_df)
             
             if current_count < min_samples_per_class:
-                print(f"Предупреждение: класс {self.id2label[label]} имеет всего {current_count} примеров")
-                # Пропускаем классы с слишком малым количеством примеров
+                print(f"Пропускаем класс {self.id2label[label]} - слишком мало примеров: {current_count}")
                 continue
             
-            # Если класс слишком мал, делаем upsampling
-            if current_count < max_samples * 0.5:  # Если меньше половины от максимального
-                upsampled_df = class_df.sample(n=max_samples, replace=True, random_state=42)
+            # Определяем целевое количество для upsampling
+            target_count = max(int(class_counts.median()), min_samples_per_class)
+            
+            if current_count < target_count:
+                upsampled_df = class_df.sample(n=target_count, replace=True, random_state=42)
                 balanced_dfs.append(upsampled_df)
                 print(f"  {self.id2label[label]}: upsampled с {current_count} до {len(upsampled_df)}")
             else:
@@ -109,6 +224,13 @@ class TextClassifierTrainer:
         if balanced_dfs:
             balanced_df = pd.concat(balanced_dfs, ignore_index=True)
             print(f"После балансировки: {len(balanced_df)} примеров")
+            
+            # Проверяем распределение после балансировки
+            balanced_counts = balanced_df['label'].value_counts().sort_index()
+            print("\nРаспределение после балансировки:")
+            for label, count in balanced_counts.items():
+                print(f"  {self.id2label[label]}: {count}")
+                
             return balanced_df
         else:
             print("Недостаточно данных для балансировки")
@@ -130,56 +252,41 @@ class TextClassifierTrainer:
         """
         Вычисление метрик для оценки
         """
-        metric = evaluate.load("accuracy")
         predictions, labels = eval_pred
         predictions = np.argmax(predictions, axis=1)
-        return metric.compute(predictions=predictions, references=labels)
+        
+        accuracy = accuracy_score(labels, predictions)
+        f1 = f1_score(labels, predictions, average='weighted')
+        
+        return {
+            "accuracy": accuracy,
+            "f1": f1
+        }
     
-    def train(self, json_file_path, output_dir="./text_classifier", 
-              test_size=0.2, epochs=10, batch_size=16, learning_rate=2e-5):
+    def train_single_fold(self, train_df, val_df, output_dir, epochs, batch_size, learning_rate, use_early_stopping, early_stopping_patience):
         """
-        Обучение модели классификации текстов
+        Обучение модели на одном фолде
         """
-        # Загрузка и подготовка данных
-        df = self.load_and_prepare_data(json_file_path)
-        
-        if len(df) == 0:
-            raise ValueError("Нет данных для обучения!")
-        
-        # Балансировка датасета
-        balanced_df = self.balance_dataset(df)
-        
-        # Разделение на train/validation
-        train_df, val_df = train_test_split(
-            balanced_df, 
-            test_size=test_size, 
-            random_state=42,
-            stratify=balanced_df['label']
-        )
-        
-        print(f"\nРазделение данных:")
-        print(f"  Train: {len(train_df)} примеров")
-        print(f"  Validation: {len(val_df)} примеров")
-        
         # Создание datasets
         train_dataset = Dataset.from_pandas(train_df[['text', 'label']])
         val_dataset = Dataset.from_pandas(val_df[['text', 'label']])
         
-        # Инициализация токенизатора и модели
-        print(f"\nЗагрузка модели {self.model_name}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        # Токенизация
+        tokenized_train = train_dataset.map(self.tokenize_function, batched=True)
+        tokenized_val = val_dataset.map(self.tokenize_function, batched=True)
         
-        self.model = AutoModelForSequenceClassification.from_pretrained(
+        # Загрузка модели
+        model = AutoModelForSequenceClassification.from_pretrained(
             self.model_name,
             num_labels=len(self.label2id),
             id2label=self.id2label,
             label2id=self.label2id
         )
         
-        # Токенизация данных
-        print("Токенизация данных...")
-        tokenized_train = train_dataset.map(self.tokenize_function, batched=True)
-        tokenized_val = val_dataset.map(self.tokenize_function, batched=True)
+        # Подготовка callbacks
+        callbacks = []
+        if use_early_stopping:
+            callbacks.append(EarlyStoppingCallback(early_stopping_patience=early_stopping_patience))
         
         # Аргументы обучения
         training_args = TrainingArguments(
@@ -191,8 +298,8 @@ class TextClassifierTrainer:
             weight_decay=0.01,
             evaluation_strategy="epoch",
             save_strategy="epoch",
-            load_best_model_at_end=True,
-            metric_for_best_model="accuracy",
+            load_best_model_at_end=use_early_stopping,
+            metric_for_best_model="f1",
             greater_is_better=True,
             logging_dir=f"{output_dir}/logs",
             logging_steps=50,
@@ -204,18 +311,123 @@ class TextClassifierTrainer:
         
         # Создание тренера
         trainer = Trainer(
-            model=self.model,
+            model=model,
             args=training_args,
             train_dataset=tokenized_train,
             eval_dataset=tokenized_val,
             tokenizer=self.tokenizer,
             compute_metrics=self.compute_metrics,
-            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
+            callbacks=callbacks
         )
         
         # Обучение
-        print("Начало обучения...")
         trainer.train()
+        
+        # Оценка
+        eval_results = trainer.evaluate()
+        
+        return trainer, eval_results
+    
+    def cross_validation_train(self, df, output_dir, n_folds=5, epochs=10, batch_size=16, learning_rate=2e-5, 
+                             use_early_stopping=True, early_stopping_patience=3):
+        """
+        Обучение с кросс-валидацией
+        """
+        print(f"\n=== КРОСС-ВАЛИДАЦИЯ ({n_folds} фолдов) ===")
+        
+        # Инициализация токенизатора
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        
+        # Стратифицированная кросс-валидация
+        skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+        
+        fold_metrics = []
+        best_fold_score = 0
+        best_fold_model = None
+        
+        for fold, (train_idx, val_idx) in enumerate(skf.split(df['text'], df['label'])):
+            print(f"\n--- Фолд {fold + 1}/{n_folds} ---")
+            
+            # Разделение данных
+            train_df = df.iloc[train_idx]
+            val_df = df.iloc[val_idx]
+            
+            print(f"  Train: {len(train_df)} примеров")
+            print(f"  Validation: {len(val_df)} примеров")
+            
+            # Создание директории для фолда
+            fold_output_dir = f"{output_dir}/fold_{fold+1}"
+            os.makedirs(fold_output_dir, exist_ok=True)
+            
+            # Обучение на фолде
+            fold_trainer, fold_metrics_result = self.train_single_fold(
+                train_df, val_df, fold_output_dir, epochs, batch_size, learning_rate,
+                use_early_stopping, early_stopping_patience
+            )
+            
+            fold_metrics.append(fold_metrics_result)
+            
+            print(f"  Метрики фолда {fold + 1}:")
+            for key, value in fold_metrics_result.items():
+                print(f"    {key}: {value:.4f}")
+            
+            # Сохранение лучшей модели
+            if fold_metrics_result['eval_f1'] > best_fold_score:
+                best_fold_score = fold_metrics_result['eval_f1']
+                best_fold_model = fold_trainer
+        
+        # Вывод средних метрик
+        print(f"\n=== РЕЗУЛЬТАТЫ КРОСС-ВАЛИДАЦИИ ===")
+        avg_metrics = {}
+        for metric in fold_metrics[0].keys():
+            values = [fold[metric] for fold in fold_metrics]
+            avg_metrics[metric] = np.mean(values)
+            std_metrics = np.std(values)
+            print(f"  {metric}: {avg_metrics[metric]:.4f} ± {std_metrics:.4f}")
+        
+        # Сохранение лучшей модели как финальной
+        if best_fold_model is not None:
+            print(f"\nСохранение лучшей модели (F1: {best_fold_score:.4f})...")
+            best_fold_model.save_model(output_dir)
+            self.tokenizer.save_pretrained(output_dir)
+            
+            # Сохранение информации о метках
+            label_info = {
+                'label2id': self.label2id,
+                'id2label': self.id2label
+            }
+            with open(f"{output_dir}/label_info.json", 'w', encoding='utf-8') as f:
+                json.dump(label_info, f, ensure_ascii=False, indent=2)
+        
+        return avg_metrics, best_fold_model
+    
+    def standard_train(self, df, output_dir, test_size=0.2, epochs=10, batch_size=16, 
+                      learning_rate=2e-5, use_early_stopping=True, early_stopping_patience=3):
+        """
+        Стандартное обучение с разделением на train/validation
+        """
+        print(f"\n=== СТАНДАРТНОЕ ОБУЧЕНИЕ ===")
+        
+        # Разделение на train/validation
+        train_df, val_df = train_test_split(
+            df, 
+            test_size=test_size, 
+            random_state=42,
+            stratify=df['label']
+        )
+        
+        print(f"Разделение данных:")
+        print(f"  Train: {len(train_df)} примеров")
+        print(f"  Validation: {len(val_df)} примеров")
+        
+        # Инициализация токенизатора
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        
+        # Обучение
+        trainer, eval_results = self.train_single_fold(
+            train_df, val_df, output_dir, epochs, batch_size, learning_rate,
+            use_early_stopping, early_stopping_patience
+        )
         
         # Сохранение модели
         print("Сохранение модели...")
@@ -230,15 +442,10 @@ class TextClassifierTrainer:
         with open(f"{output_dir}/label_info.json", 'w', encoding='utf-8') as f:
             json.dump(label_info, f, ensure_ascii=False, indent=2)
         
-        # Финальная оценка
-        print("\nФинальная оценка...")
-        eval_results = trainer.evaluate()
-        print("Результаты оценки:")
-        for key, value in eval_results.items():
-            print(f"  {key}: {value:.4f}")
-        
-        # Детальная классификационный отчет
+        # Детальный классификационный отчет
         print("\nДетальный отчет по классификации:")
+        val_dataset = Dataset.from_pandas(val_df[['text', 'label']])
+        tokenized_val = val_dataset.map(self.tokenize_function, batched=True)
         predictions = trainer.predict(tokenized_val)
         y_pred = np.argmax(predictions.predictions, axis=1)
         y_true = predictions.label_ids
@@ -246,12 +453,44 @@ class TextClassifierTrainer:
         print(classification_report(y_true, y_pred, 
                                   target_names=[self.id2label[i] for i in range(len(self.id2label))]))
         
-        return trainer
+        return eval_results, trainer
+    
+    def train(self, json_file_path, output_dir="./text_classifier", 
+              use_cross_validation=True, n_folds=5, test_size=0.2, epochs=10, 
+              batch_size=16, learning_rate=2e-5, use_early_stopping=True, 
+              early_stopping_patience=3, balance_data=True):
+        """
+        Основной метод обучения модели
+        """
+        # Загрузка и подготовка данных
+        df = self.load_and_prepare_data(json_file_path)
+        
+        if len(df) == 0:
+            raise ValueError("Нет данных для обучения!")
+        
+        # Балансировка датасета
+        if balance_data:
+            df = self.balance_dataset(df)
+        
+        # Выбор режима обучения
+        if use_cross_validation:
+            results, trainer = self.cross_validation_train(
+                df, output_dir, n_folds, epochs, batch_size, learning_rate,
+                use_early_stopping, early_stopping_patience
+            )
+        else:
+            results, trainer = self.standard_train(
+                df, output_dir, test_size, epochs, batch_size, learning_rate,
+                use_early_stopping, early_stopping_patience
+            )
+        
+        print(f"\nОбучение завершено! Модель сохранена в {output_dir}")
+        return results, trainer
 
 # Альтернативный вариант с моделью cis-lmu/glotlid
 class GlotLIDTextClassifierTrainer(TextClassifierTrainer):
     def __init__(self):
-        super().__init__(model_name="cis-lmu/glotlid-6L")
+        super().__init__(model_name="cis-lmu/glotlid-6l")
 
 def main():
     """
@@ -277,18 +516,22 @@ def main():
         trainer = TextClassifierTrainer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
         # trainer = GlotLIDTextClassifierTrainer()  # Альтернативный вариант
         
-        result = trainer.train(
+        results, model_trainer = trainer.train(
             json_file_path=JSON_FILE_PATH,
             output_dir=OUTPUT_DIR,
+            use_cross_validation=True,  # Включена кросс-валидация
+            n_folds=5,                  # 5 фолдов
             epochs=10,
             batch_size=16,
-            learning_rate=2e-5
+            learning_rate=2e-5,
+            use_early_stopping=True,    # Включен early stopping
+            early_stopping_patience=3,  # Patience для early stopping
+            balance_data=True           # Балансировка данных
         )
         
-        if result is not None:
-            print(f"\nОбучение завершено успешно! Модель сохранена в {OUTPUT_DIR}")
-        else:
-            print("Обучение завершилось с ошибками!")
+        print(f"\nФинальные результаты:")
+        for key, value in results.items():
+            print(f"  {key}: {value:.4f}")
         
     except Exception as e:
         print(f"Ошибка при обучении: {e}")
