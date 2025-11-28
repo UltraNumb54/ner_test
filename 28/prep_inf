@@ -4,7 +4,7 @@ import string
 from typing import List, Dict, Any, Tuple
 import os
 import torch
-from transformers import BertTokenizer, BertForTokenClassification
+from transformers import AutoTokenizer, AutoModelForTokenClassification
 import pymorphy3
 import numpy as np
 
@@ -229,12 +229,13 @@ class NERTextProcessor:
         """
         Инициализация NER модели для обработки текста
         """
-        # Используем BertTokenizer вместо AutoTokenizer для избежания проблем с Mistral
-        self.tokenizer = BertTokenizer.from_pretrained(
+        # Используем AutoTokenizer с fast=True для избежания проблем
+        self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
-            local_files_only=True
+            local_files_only=True,
+            use_fast=True  # Важно для поддержки return_offsets_mapping
         )
-        self.model = BertForTokenClassification.from_pretrained(
+        self.model = AutoModelForTokenClassification.from_pretrained(
             model_path,
             local_files_only=True
         )
@@ -254,11 +255,10 @@ class NERTextProcessor:
             'MISC': 'ПРОЧЕЕ',
             'AGM': 'АГМ',
             'AMG2': 'АМГ2'
-            # Добавьте другие метки по необходимости
         }
         
-        # Список сущностей для удаления
-        self.entities_to_remove = ['AGM', 'AMG2']
+        # Список сущностей для удаления (регистронезависимый)
+        self.entities_to_remove = ['agm', 'amg2']
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Используется устройство: {self.device}")
@@ -275,6 +275,20 @@ class NERTextProcessor:
         """
         return self.entity_translation.get(entity_type, entity_type)
     
+    def should_remove_entity(self, entity_type: str) -> bool:
+        """
+        Проверка, нужно ли удалять сущность (регистронезависимо)
+        """
+        return entity_type.lower() in self.entities_to_remove
+    
+    def merge_duplicate_entities(self, text: str) -> str:
+        """
+        Объединение повторяющихся сущностей подряд (например, [AGM][AGM] -> [AGM])
+        """
+        # Находим и объединяем повторяющиеся сущности
+        pattern = r'(\[[A-ZА-Я_]+\])(?:\s*\1)+'
+        return re.sub(pattern, r'\1', text)
+    
     def replace_entities(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Замена сущностей в тексте с помощью NER модели
@@ -283,7 +297,7 @@ class NERTextProcessor:
             return text, []
         
         try:
-            # Токенизация текста для BERT
+            # Токенизация текста
             inputs = self.tokenizer(
                 text,
                 return_offsets_mapping=True,
@@ -324,8 +338,9 @@ class NERTextProcessor:
                 original_text = entity['text']
                 entity_type = entity['entity']
                 
-                # Пропускаем сущности, которые нужно удалить
-                if entity_type in self.entities_to_remove:
+                # Пропускаем сущности, которые нужно удалить (регистронезависимо)
+                if self.should_remove_entity(entity_type):
+                    print(f"Пропускаем сущность для удаления: {entity_type} -> {original_text}")
                     continue
                 
                 # Переводим название сущности на русский
@@ -344,7 +359,7 @@ class NERTextProcessor:
                     'position': (int(entity['start']), int(entity['end']))
                 })
             
-            # Объединяем повторяющиеся сущности (например, [AGM][AGM] -> [AGM])
+            # Объединяем повторяющиеся сущности
             replaced_text = self.merge_duplicate_entities(replaced_text)
             
             return replaced_text, entity_replacements
@@ -352,14 +367,6 @@ class NERTextProcessor:
         except Exception as e:
             print(f"Ошибка при обработке NER: {e}")
             return text, []
-    
-    def merge_duplicate_entities(self, text: str) -> str:
-        """
-        Объединение повторяющихся сущностей подряд (например, [AGM][AGM] -> [AGM])
-        """
-        # Находим и объединяем повторяющиеся сущности
-        pattern = r'(\[[A-ZА-Я_]+\])(?:\s*\1)+'
-        return re.sub(pattern, r'\1', text)
     
     def _extract_entities_from_predictions(self, text: str, predictions: np.ndarray, offset_mapping: torch.Tensor) -> List[Dict]:
         """
