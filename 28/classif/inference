@@ -1,0 +1,115 @@
+import json
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import numpy as np
+
+class ServiceClassifier:
+    def __init__(self, model_path):
+        """
+        Инициализация классификатора для предсказания service
+        """
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_path)
+        
+        # Загрузка информации о метках
+        with open(f"{model_path}/label_info.json", 'r', encoding='utf-8') as f:
+            label_info = json.load(f)
+            self.id2label = label_info['id2label']
+            self.label2id = label_info['label2id']
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        self.model.eval()
+    
+    def predict(self, text, return_probabilities=False):
+        """
+        Предсказание service для текста
+        """
+        # Токенизация
+        inputs = self.tokenizer(
+            text,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt"
+        )
+        
+        # Перенос на устройство
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # Предсказание
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        
+        # Получение вероятностей
+        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        predicted_class_id = probabilities.argmax().item()
+        predicted_service = self.id2label[str(predicted_class_id)]
+        
+        if return_probabilities:
+            # Возвращаем все вероятности
+            all_probs = probabilities.cpu().numpy()[0]
+            prob_dict = {self.id2label[str(i)]: float(prob) for i, prob in enumerate(all_probs)}
+            return predicted_service, prob_dict
+        else:
+            return predicted_service
+    
+    def predict_batch(self, texts, return_probabilities=False):
+        """
+        Пакетное предсказание для списка текстов
+        """
+        results = []
+        
+        for text in texts:
+            if return_probabilities:
+                prediction, probabilities = self.predict(text, return_probabilities=True)
+                results.append({
+                    'text': text,
+                    'predicted_service': prediction,
+                    'probabilities': probabilities
+                })
+            else:
+                prediction = self.predict(text)
+                results.append({
+                    'text': text,
+                    'predicted_service': prediction
+                })
+        
+        return results
+
+# Пример использования
+def test_classifier():
+    """
+    Тестирование обученного классификатора
+    """
+    MODEL_PATH = "./service_classifier"  # Путь к обученной модели
+    
+    try:
+        classifier = ServiceClassifier(MODEL_PATH)
+        
+        # Тестовые примеры
+        test_texts = [
+            "Помогите настроить подключение к интернету",
+            "Не работает принтер в офисе",
+            "Нужно обновить программное обеспечение",
+            "Проблема с электронной почтой"
+        ]
+        
+        print("Тестирование классификатора:")
+        print("-" * 50)
+        
+        results = classifier.predict_batch(test_texts, return_probabilities=True)
+        
+        for result in results:
+            print(f"Текст: {result['text']}")
+            print(f"Предсказанный service: {result['predicted_service']}")
+            print("Вероятности:")
+            for service, prob in sorted(result['probabilities'].items(), key=lambda x: x[1], reverse=True)[:3]:
+                print(f"  {service}: {prob:.4f}")
+            print("-" * 30)
+            
+    except Exception as e:
+        print(f"Ошибка при тестировании классификатора: {e}")
+
+if __name__ == "__main__":
+    test_classifier()
