@@ -4,8 +4,8 @@ import string
 from typing import List, Dict, Any, Tuple
 import os
 import torch
-from transformers import AutoTokenizer, AutoModelForTokenClassification
-import pymorphy3  # для лемматизации русского языка
+from transformers import BertTokenizer, BertForTokenClassification
+import pymorphy3
 import numpy as np
 
 class TextPreprocessor:
@@ -15,8 +15,7 @@ class TextPreprocessor:
                  remove_punctuation: bool = True,
                  remove_digits: bool = True,
                  remove_stopwords: bool = True,
-                 lemmatize: bool = False,
-                 protect_ner_tags: bool = True):  # Новый параметр для защиты NER меток
+                 lemmatize: bool = False):
         
         self.remove_brackets = remove_brackets
         self.to_lower = to_lower
@@ -24,7 +23,6 @@ class TextPreprocessor:
         self.remove_digits = remove_digits
         self.remove_stopwords = remove_stopwords
         self.lemmatize = lemmatize
-        self.protect_ner_tags = protect_ner_tags
         
         # Базовый список стоп-слов для русского языка
         self.stopwords = set([
@@ -45,57 +43,18 @@ class TextPreprocessor:
         if self.lemmatize:
             self.morph = pymorphy3.MorphAnalyzer()
     
-    def protect_ner_tags_in_text(self, text: str) -> Tuple[str, Dict[str, str]]:
-        """
-        Защищает NER теги от обработки, заменяя их временными плейсхолдерами
-        """
-        if not self.protect_ner_tags:
-            return text, {}
-        
-        # Ищем все NER теги в тексте
-        ner_tags = re.findall(r'\[([A-Z_]+)\]', text)
-        protected_tags = {}
-        protected_text = text
-        
-        for i, tag in enumerate(ner_tags):
-            placeholder = f"__NER_{i}__"
-            protected_tags[placeholder] = f"[{tag}]"
-            protected_text = protected_text.replace(f"[{tag}]", placeholder)
-        
-        return protected_text, protected_tags
-    
-    def restore_ner_tags(self, text: str, protected_tags: Dict[str, str]) -> str:
-        """
-        Восстанавливает NER теги из плейсхолдеров
-        """
-        if not self.protect_ner_tags:
-            return text
-        
-        restored_text = text
-        for placeholder, original_tag in protected_tags.items():
-            restored_text = restored_text.replace(placeholder, original_tag)
-        
-        return restored_text
-    
     def remove_bracket_content(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Удаление всего в [], {}, <> включая сами скобки
-        Но защищаем NER теги если protect_ner_tags=True
         """
         original_text = text
         
-        # Защищаем NER теги
-        protected_text, protected_tags = self.protect_ner_tags_in_text(text)
-        
-        # Удаляем содержимое в квадратных скобках (кроме защищенных)
-        protected_text = re.sub(r'\[.*?\]', '', protected_text)
+        # Удаляем содержимое в квадратных скобках
+        text = re.sub(r'\[.*?\]', '', text)
         # Удаляем содержимое в фигурных скобках
-        protected_text = re.sub(r'\{.*?\}', '', protected_text)
+        text = re.sub(r'\{.*?\}', '', text)
         # Удаляем содержимое в угловых скобках
-        protected_text = re.sub(r'\<.*?\>', '', protected_text)
-        
-        # Восстанавливаем NER теги
-        text = self.restore_ner_tags(protected_text, protected_tags)
+        text = re.sub(r'\<.*?\>', '', text)
         
         # Убираем лишние пробелы после удаления
         text = re.sub(r'\s+', ' ', text).strip()
@@ -113,19 +72,12 @@ class TextPreprocessor:
     def remove_punctuation_and_special(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Замена всей пунктуации и спецсимволов на пробел
-        Защищаем NER теги если protect_ner_tags=True
         """
         original_text = text
         
-        # Защищаем NER теги
-        protected_text, protected_tags = self.protect_ner_tags_in_text(text)
-        
         # Создаем таблицу переводов для замены пунктуации на пробелы
         translator = str.maketrans(string.punctuation + '«»—…', ' ' * (len(string.punctuation) + 4))
-        protected_text = protected_text.translate(translator)
-        
-        # Восстанавливаем NER теги
-        text = self.restore_ner_tags(protected_text, protected_tags)
+        text = text.translate(translator)
         
         replacements = []
         if text != original_text:
@@ -140,18 +92,9 @@ class TextPreprocessor:
     def remove_digits_from_text(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Удаление цифр из текста
-        Защищаем NER теги если protect_ner_tags=True
         """
         original_text = text
-        
-        # Защищаем NER теги
-        protected_text, protected_tags = self.protect_ner_tags_in_text(text)
-        
-        # Удаляем цифры
-        protected_text = re.sub(r'\d+', '', protected_text)
-        
-        # Восстанавливаем NER теги
-        text = self.restore_ner_tags(protected_text, protected_tags)
+        text = re.sub(r'\d+', '', text)
         
         replacements = []
         if text != original_text:
@@ -212,18 +155,9 @@ class TextPreprocessor:
     def to_lower_case(self, text: str) -> Tuple[str, List[Dict]]:
         """
         Приведение текста к нижнему регистру
-        Защищаем NER теги если protect_ner_tags=True
         """
         original_text = text
-        
-        # Защищаем NER теги
-        protected_text, protected_tags = self.protect_ner_tags_in_text(text)
-        
-        # Приводим к нижнему регистру
-        protected_text = protected_text.lower()
-        
-        # Восстанавливаем NER теги
-        text = self.restore_ner_tags(protected_text, protected_tags)
+        text = text.lower()
         
         replacements = []
         if text != original_text:
@@ -252,93 +186,39 @@ class TextPreprocessor:
         
         return text, replacements
     
-    def remove_specific_entities(self, text: str, entities_to_remove: List[str] = None) -> Tuple[str, List[Dict]]:
-        """
-        Удаление конкретных сущностей из текста (например, AGM, AMG2)
-        """
-        if entities_to_remove is None:
-            entities_to_remove = ['AGM', 'AMG2']
-        
-        original_text = text
-        
-        for entity in entities_to_remove:
-            text = re.sub(r'\s*\[' + re.escape(entity) + r'\]\s*', ' ', text)
-        
-        # Убираем лишние пробелы
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        replacements = []
-        if text != original_text:
-            replacements.append({
-                'type': 'remove_specific_entities',
-                'from_text': original_text,
-                'to_text': text,
-                'removed_entities': entities_to_remove
-            })
-        
-        return text, replacements
-    
-    def merge_duplicate_entities(self, text: str) -> Tuple[str, List[Dict]]:
-        """
-        Объединение повторяющихся сущностей подряд (например, [AGM][AGM] -> [AGM])
-        """
-        original_text = text
-        
-        # Находим и объединяем повторяющиеся сущности
-        pattern = r'(\[[A-Z_]+\])(?:\s*\1)+'
-        text = re.sub(pattern, r'\1', text)
-        
-        replacements = []
-        if text != original_text:
-            replacements.append({
-                'type': 'merge_duplicate_entities',
-                'from_text': original_text,
-                'to_text': text
-            })
-        
-        return text, replacements
-    
     def preprocess_text_after_ner(self, text: str) -> Tuple[str, List[Dict]]:
         """
-        Полная предобработка текста ПОСЛЕ применения NER с защитой тегов
+        Полная предобработка текста ПОСЛЕ применения NER
         """
         current_text = text
         all_replacements = []
         
-        # 0. Объединяем дублирующиеся сущности
-        current_text, replacements = self.merge_duplicate_entities(current_text)
-        all_replacements.extend(replacements)
-        
-        # 1. Удаляем конкретные сущности (AGM, AMG2)
-        current_text, replacements = self.remove_specific_entities(current_text)
-        all_replacements.extend(replacements)
-        
-        # 2. Приведение к нижнему регистру (с защитой NER тегов)
+        # 1. Приведение к нижнему регистру
         if self.to_lower:
             current_text, replacements = self.to_lower_case(current_text)
             all_replacements.extend(replacements)
         
-        # 3. Замена пунктуации и спецсимволов на пробел (с защитой NER тегов)
+        # 2. Замена пунктуации и спецсимволов на пробел
         if self.remove_punctuation:
             current_text, replacements = self.remove_punctuation_and_special(current_text)
             all_replacements.extend(replacements)
         
-        # 4. Удаление цифр (с защитой NER тегов)
+        # 3. Удаление цифр
         if self.remove_digits:
             current_text, replacements = self.remove_digits_from_text(current_text)
             all_replacements.extend(replacements)
         
-        # 5. Удаление стоп-слов
+        # 4. Удаление стоп-слов
         if self.remove_stopwords:
             current_text, replacements = self.remove_stopwords_from_text(current_text)
             all_replacements.extend(replacements)
         
-        # 6. Лемматизация
+        # 5. Лемматизация
         if self.lemmatize:
             current_text, replacements = self.lemmatize_text(current_text)
             all_replacements.extend(replacements)
         
-        # 7. Удаление лишних пробелов (всегда применяется)
+        # 6. Удаление лишних пробелов (всегда применяется)
         current_text, replacements = self.collapse_spaces(current_text)
         all_replacements.extend(replacements)
         
@@ -349,19 +229,14 @@ class NERTextProcessor:
         """
         Инициализация NER модели для обработки текста
         """
-        # Очистка кэша и принудительное использование локальных файлов
-        self.clear_transformers_cache()
-        
-        # Явно указываем использование локальной модели
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        # Используем BertTokenizer вместо AutoTokenizer для избежания проблем с Mistral
+        self.tokenizer = BertTokenizer.from_pretrained(
             model_path,
-            local_files_only=True,
-            trust_remote_code=False
+            local_files_only=True
         )
-        self.model = AutoModelForTokenClassification.from_pretrained(
+        self.model = BertForTokenClassification.from_pretrained(
             model_path,
-            local_files_only=True,
-            trust_remote_code=False
+            local_files_only=True
         )
         
         # Загрузка информации о метках
@@ -382,6 +257,9 @@ class NERTextProcessor:
             # Добавьте другие метки по необходимости
         }
         
+        # Список сущностей для удаления
+        self.entities_to_remove = ['AGM', 'AMG2']
+        
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Используется устройство: {self.device}")
         self.model.to(self.device)
@@ -390,19 +268,6 @@ class NERTextProcessor:
         # Гарантируем, что данные не отправляются
         os.environ['TRANSFORMERS_OFFLINE'] = '1'
         os.environ['HF_DATASETS_OFFLINE'] = '1'
-    
-    def clear_transformers_cache(self):
-        """
-        Очистка кэша transformers для устранения проблем с Mistral
-        """
-        try:
-            from transformers.utils.hub import TRANSFORMERS_CACHE
-            import shutil
-            if os.path.exists(TRANSFORMERS_CACHE):
-                print("Очистка кэша transformers...")
-                shutil.rmtree(TRANSFORMERS_CACHE)
-        except:
-            pass  # Игнорируем ошибки очистки кэша
     
     def translate_entity(self, entity_type: str) -> str:
         """
@@ -458,6 +323,11 @@ class NERTextProcessor:
             for entity in sorted_entities:
                 original_text = entity['text']
                 entity_type = entity['entity']
+                
+                # Пропускаем сущности, которые нужно удалить
+                if entity_type in self.entities_to_remove:
+                    continue
+                
                 # Переводим название сущности на русский
                 translated_entity = self.translate_entity(entity_type)
                 replacement = f"[{translated_entity}]"
@@ -474,11 +344,22 @@ class NERTextProcessor:
                     'position': (int(entity['start']), int(entity['end']))
                 })
             
+            # Объединяем повторяющиеся сущности (например, [AGM][AGM] -> [AGM])
+            replaced_text = self.merge_duplicate_entities(replaced_text)
+            
             return replaced_text, entity_replacements
         
         except Exception as e:
             print(f"Ошибка при обработке NER: {e}")
             return text, []
+    
+    def merge_duplicate_entities(self, text: str) -> str:
+        """
+        Объединение повторяющихся сущностей подряд (например, [AGM][AGM] -> [AGM])
+        """
+        # Находим и объединяем повторяющиеся сущности
+        pattern = r'(\[[A-ZА-Я_]+\])(?:\s*\1)+'
+        return re.sub(pattern, r'\1', text)
     
     def _extract_entities_from_predictions(self, text: str, predictions: np.ndarray, offset_mapping: torch.Tensor) -> List[Dict]:
         """
@@ -538,8 +419,6 @@ class NERTextProcessor:
 class JSONPreprocessor:
     def __init__(self, model_path: str, preprocessor_config: Dict):
         self.ner_processor = NERTextProcessor(model_path)
-        # Добавляем защиту NER тегов в конфиг
-        preprocessor_config['protect_ner_tags'] = True
         self.text_preprocessor = TextPreprocessor(**preprocessor_config)
     
     def convert_to_serializable(self, obj):
@@ -589,31 +468,24 @@ class JSONPreprocessor:
             original_text = item.get('original_text', '')
             topic = item.get('metadata', {}).get('topic', '')
             
-            all_replacements = []
+            # Только NER замены для result1
+            ner_replacements = []
             
             # 1. Сначала удаляем скобки из текста и topic
             text_after_brackets, text_bracket_replacements = self.text_preprocessor.remove_bracket_content(original_text)
             topic_after_brackets, topic_bracket_replacements = self.text_preprocessor.remove_bracket_content(topic)
             
-            all_replacements.extend(text_bracket_replacements)
-            all_replacements.extend(topic_bracket_replacements)
-            
             # 2. Затем применяем NER к тексту после удаления скобок
+            # Внутри NER: заменяем сущности, удаляем ненужные, переводим названия, объединяем дубликаты
             text_with_ner, text_ner_replacements = self.ner_processor.replace_entities(text_after_brackets)
             topic_with_ner, topic_ner_replacements = self.ner_processor.replace_entities(topic_after_brackets)
             
-            all_replacements.extend(text_ner_replacements)
-            all_replacements.extend(topic_ner_replacements)
+            ner_replacements.extend(text_ner_replacements)
+            ner_replacements.extend(topic_ner_replacements)
             
             # 3. Затем применяем остальные шаги предобработки к тексту с NER
             processed_text, text_preprocessing_replacements = self.text_preprocessor.preprocess_text_after_ner(text_with_ner)
             processed_topic, topic_preprocessing_replacements = self.text_preprocessor.preprocess_text_after_ner(topic_with_ner)
-            
-            all_replacements.extend(text_preprocessing_replacements)
-            all_replacements.extend(topic_preprocessing_replacements)
-            
-            # Фильтруем замены - оставляем только NER замены для result1
-            ner_replacements = [r for r in all_replacements if r.get('type') == 'ner_replacement']
             
             # Объединяем последовательные NER замены
             merged_ner_replacements = self._merge_consecutive_ner_replacements(ner_replacements)
