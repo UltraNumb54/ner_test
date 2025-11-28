@@ -5,19 +5,26 @@ from transformers import (
     AutoModelForTokenClassification, 
     TrainingArguments, 
     Trainer,
-    DataCollatorForTokenClassification
+    DataCollatorForTokenClassification,
+    EarlyStoppingCallback
 )
 from datasets import Dataset
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 import os
 import evaluate
 
 class NERModelTrainer:
-    def __init__(self, model_name="bert-base-multilingual-cased", max_length=512):
+    def __init__(self, model_name="bert-base-multilingual-cased", max_length=512, local_files_only=True):
         self.model_name = model_name
         self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.local_files_only = local_files_only
+        
+        # Загрузка токенизатора локально
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            local_files_only=local_files_only
+        )
         self.label2id = {}
         self.id2label = {}
         
@@ -232,13 +239,12 @@ class NERModelTrainer:
         
         return tokenized_dataset
     
-    def compute_metrics(self, eval_pred):
+    def compute_detailed_metrics(self, eval_pred):
         """
-        Исправленная функция вычисления метрик с обработкой KeyError
+        Детализированные метрики по типам сущностей
         """
         try:
             metric = evaluate.load("seqeval")
-            
             predictions, labels = eval_pred
             
             # Убеждаемся, что predictions и labels имеют правильную форму
@@ -276,12 +282,23 @@ class NERModelTrainer:
             # Вычисляем метрики
             results = metric.compute(predictions=true_predictions, references=true_labels)
             
-            return {
+            # Детализированные результаты
+            detailed_results = {
                 "precision": results["overall_precision"],
                 "recall": results["overall_recall"],
                 "f1": results["overall_f1"],
                 "accuracy": results["overall_accuracy"],
             }
+            
+            # Добавляем метрики по классам
+            for key, value in results.items():
+                if key not in ["overall_precision", "overall_recall", "overall_f1", "overall_accuracy"]:
+                    if isinstance(value, dict):
+                        detailed_results[f"{key}_f1"] = value.get("f1", 0)
+                        detailed_results[f"{key}_precision"] = value.get("precision", 0)
+                        detailed_results[f"{key}_recall"] = value.get("recall", 0)
+            
+            return detailed_results
             
         except Exception as e:
             print(f"Ошибка в compute_metrics: {e}")
@@ -312,9 +329,106 @@ class NERModelTrainer:
                 print(f"  ОТСУТСТВУЮЩИЕ МЕТКИ: {missing}")
             print("---")
     
-    def train(self, json_file_path, output_dir="./ner_model", train_size=0.8, epochs=3, batch_size=16):
+    def get_optimized_training_args(self, output_dir, batch_size=8, dataset_size=700):
         """
-        Основной метод обучения модели
+        Оптимизированные параметры для маленького датасета
+        """
+        # Эмпирические правила для маленьких датасетов
+        effective_batch_size = batch_size * torch.cuda.device_count() if torch.cuda.is_available() else batch_size
+        steps_per_epoch = max(1, dataset_size // effective_batch_size)
+        
+        return TrainingArguments(
+            output_dir=output_dir,
+            learning_rate=3e-5,  # Чуть выше learning rate
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            num_train_epochs=15,  # Максимум
+            weight_decay=0.01,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            load_best_model_at_end=True,
+            metric_for_best_model="f1",
+            greater_is_better=True,
+            logging_dir=f"{output_dir}/logs",
+            logging_steps=max(10, steps_per_epoch // 5),  # Адаптивный logging
+            save_total_limit=2,
+            seed=42,
+            warmup_ratio=0.1,  # Процент от общего числа шагов для warmup
+            remove_unused_columns=False,
+            dataloader_num_workers=0,  # Для избежания проблем на Windows
+            report_to=None,  # Отключаем отчеты для полной локальности
+        )
+    
+    def _train_single_fold(self, train_data, val_data, output_dir, epochs=10, batch_size=8):
+        """
+        Обучение одной модели на одном фолде
+        """
+        # Подготовка датасетов
+        train_dataset = self.prepare_dataset(train_data)
+        val_dataset = self.prepare_dataset(val_data)
+        
+        # Загрузка модели локально
+        model = AutoModelForTokenClassification.from_pretrained(
+            self.model_name,
+            num_labels=len(self.label2id),
+            id2label=self.id2label,
+            label2id=self.label2id,
+            local_files_only=self.local_files_only
+        )
+        
+        # Коллатор данных для пакетной обработки
+        data_collator = DataCollatorForTokenClassification(
+            tokenizer=self.tokenizer,
+            padding=True
+        )
+        
+        # Аргументы обучения
+        training_args = self.get_optimized_training_args(
+            output_dir, 
+            batch_size=batch_size, 
+            dataset_size=len(train_data)
+        )
+        
+        # Тренер
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            tokenizer=self.tokenizer,
+            data_collator=data_collator,
+            compute_metrics=self.compute_detailed_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]  # Остановка после 3 эпох без улучшений
+        )
+        
+        # Обучение
+        print(f"Начало обучения фолда...")
+        try:
+            trainer.train()
+            
+            # Сохранение модели
+            trainer.save_model(output_dir)
+            self.tokenizer.save_pretrained(output_dir)
+            
+            # Сохранение информации о метках
+            label_info = {
+                'label2id': self.label2id,
+                'id2label': self.id2label
+            }
+            with open(f"{output_dir}/label_info.json", 'w', encoding='utf-8') as f:
+                json.dump(label_info, f, ensure_ascii=False, indent=2)
+            
+            return trainer
+            
+        except Exception as e:
+            print(f"Ошибка во время обучения фолда: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def train(self, json_file_path, output_dir="./ner_model", train_size=0.8, epochs=10, batch_size=8):
+        """
+        Основной метод обучения модели с early stopping
         """
         # Загрузка данных
         print("Загрузка данных...")
@@ -344,126 +458,183 @@ class NERModelTrainer:
         if len(train_data) == 0 or len(val_data) == 0:
             raise ValueError("После разделения один из наборов данных пуст!")
         
-        # Подготовка датасетов
-        print("Подготовка датасетов...")
-        train_dataset = self.prepare_dataset(train_data)
-        val_dataset = self.prepare_dataset(val_data)
+        # Обучение одной модели
+        trainer = self._train_single_fold(train_data, val_data, output_dir, epochs, batch_size)
         
-        # Загрузка модели
-        print("Загрузка модели...")
-        model = AutoModelForTokenClassification.from_pretrained(
-            self.model_name,
-            num_labels=len(self.label2id),
-            id2label=self.id2label,
-            label2id=self.label2id
-        )
-        
-        # Коллатор данных для пакетной обработки
-        data_collator = DataCollatorForTokenClassification(
-            tokenizer=self.tokenizer,
-            padding=True
-        )
-        
-        # Аргументы обучения
-        training_args = TrainingArguments(
-            output_dir=output_dir,
-            learning_rate=2e-5,
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            num_train_epochs=epochs,
-            weight_decay=0.01,
-            evaluation_strategy="epoch",
-            save_strategy="epoch",
-            load_best_model_at_end=True,
-            metric_for_best_model="f1",
-            greater_is_better=True,
-            logging_dir=f"{output_dir}/logs",
-            logging_steps=50,
-            save_total_limit=2,
-            seed=42,
-            data_seed=42,
-            warmup_steps=500,
-            remove_unused_columns=False,
-        )
-        
-        # Тренер
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            tokenizer=self.tokenizer,
-            data_collator=data_collator,
-            compute_metrics=self.compute_metrics,
-        )
-        
-        # Обучение
-        print("Начало обучения...")
-        try:
-            trainer.train()
-        except Exception as e:
-            print(f"Ошибка во время обучения: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-        
-        # Сохранение модели
-        print("Сохранение модели...")
-        trainer.save_model(output_dir)
-        self.tokenizer.save_pretrained(output_dir)
-        
-        # Сохранение информации о метках ВМЕСТЕ с моделью
-        label_info = {
-            'label2id': self.label2id,
-            'id2label': self.id2label
-        }
-        with open(f"{output_dir}/label_info.json", 'w', encoding='utf-8') as f:
-            json.dump(label_info, f, ensure_ascii=False, indent=2)
-        
-        print(f"Модель сохранена в {output_dir}")
-        
-        # Финальная оценка
-        print("Финальная оценка...")
-        try:
-            eval_results = trainer.evaluate()
-            print("Результаты оценки:")
-            for key, value in eval_results.items():
-                print(f"  {key}: {value:.4f}")
-        except Exception as e:
-            print(f"Ошибка при оценке: {e}")
+        if trainer:
+            # Финальная оценка
+            print("Финальная оценка...")
+            try:
+                eval_results = trainer.evaluate()
+                print("Результаты оценки:")
+                for key, value in eval_results.items():
+                    if isinstance(value, float):
+                        print(f"  {key}: {value:.4f}")
+            except Exception as e:
+                print(f"Ошибка при оценке: {e}")
         
         return trainer
+    
+    def train_with_cross_validation(self, json_file_path, output_dir="./ner_model_cv", 
+                                  n_splits=3, epochs=10, batch_size=8):
+        """
+        Обучение с кросс-валидацией
+        """
+        # Загрузка данных
+        print("Загрузка данных для кросс-валидации...")
+        data = self.load_and_filter_data(json_file_path)
+        
+        if len(data) == 0:
+            raise ValueError("Нет размеченных данных для обучения!")
+        
+        # Извлечение меток
+        print("Извлечение меток...")
+        self.extract_labels_from_data(data)
+        
+        # K-Fold кросс-валидация
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        fold_scores = []
+        
+        for fold, (train_idx, val_idx) in enumerate(kf.split(data)):
+            print(f"\n=== Обучение Fold {fold + 1}/{n_splits} ===")
+            
+            # Разделение данных
+            train_data = [data[i] for i in train_idx]
+            val_data = [data[i] for i in val_idx]
+            
+            print(f"Fold {fold + 1}: {len(train_data)} train, {len(val_data)} validation")
+            
+            # Обучение для этого фолда
+            fold_dir = f"{output_dir}_fold_{fold+1}"
+            trainer = self._train_single_fold(train_data, val_data, fold_dir, epochs, batch_size)
+            
+            if trainer:
+                eval_results = trainer.evaluate()
+                fold_f1 = eval_results.get('eval_f1', 0)
+                fold_scores.append(fold_f1)
+                print(f"Fold {fold+1} F1: {fold_f1:.4f}")
+        
+        print(f"\n=== Результаты кросс-валидации ===")
+        if fold_scores:
+            print(f"Средний F1: {np.mean(fold_scores):.4f} (±{np.std(fold_scores):.4f})")
+            print(f"Результаты по фолдам: {fold_scores}")
+        
+        return fold_scores
+
+def create_sample_dataset(output_path="sample_dataset.json"):
+    """
+    Создает пример датасета для тестирования (если у вас нет данных)
+    """
+    sample_data = [
+        {
+            "id": 1,
+            "success": True,
+            "tokens": ["Иван", "Иванов", "работает", "в", "компании", "Рога", "и", "копыта"],
+            "ner_tags": ["B-PER", "I-PER", "O", "O", "O", "B-ORG", "I-ORG", "I-ORG"],
+            "original_text": "Иван Иванов работает в компании Рога и копыта"
+        },
+        {
+            "id": 2,
+            "success": True,
+            "tokens": ["Мария", "Петрова", "живет", "в", "Москве"],
+            "ner_tags": ["B-PER", "I-PER", "O", "O", "B-LOC"],
+            "original_text": "Мария Петрова живет в Москве"
+        },
+        {
+            "id": 3,
+            "success": True,
+            "tokens": ["Компания", "Apple", "выпустила", "новый", "iPhone"],
+            "ner_tags": ["O", "B-ORG", "O", "O", "O"],
+            "original_text": "Компания Apple выпустила новый iPhone"
+        }
+    ]
+    
+    # Создаем больше примеров для реалистичного датасета
+    for i in range(4, 701):
+        sample_data.append({
+            "id": i,
+            "success": True,
+            "tokens": ["Пример", "текста", "с", "разными", "сущностями"],
+            "ner_tags": ["O", "O", "O", "O", "O"],
+            "original_text": f"Пример текста {i} с разными сущностями"
+        })
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(sample_data, f, ensure_ascii=False, indent=2)
+    
+    print(f"Создан пример датасета с {len(sample_data)} записями в {output_path}")
+    return output_path
 
 def main():
     """
-    Пример использования
+    Пример использования с полной локальностью
     """
     # Укажите путь к вашему JSON файлу
-    JSON_FILE_PATH = "merged_dataset.json"  # Замените на путь к вашему файлу
+    JSON_FILE_PATH = "merged_dataset.json"
+    
+    # Если файла нет, создаем пример датасета
+    if not os.path.exists(JSON_FILE_PATH):
+        print(f"Файл {JSON_FILE_PATH} не найден. Создаю пример датасета...")
+        JSON_FILE_PATH = create_sample_dataset()
+    
     OUTPUT_DIR = "./trained_ner_model"
     
-    # Проверка существования файла
-    if not os.path.exists(JSON_FILE_PATH):
-        print(f"Ошибка: файл {JSON_FILE_PATH} не найден!")
-        return
-    
-    # Создание тренера и обучение
+    # Создание тренера с полной локальностью
     trainer = NERModelTrainer(
-        model_name="bert-base-multilingual-cased",
-        max_length=512
+        model_name="bert-base-multilingual-cased",  # Должна быть скачана заранее
+        max_length=256,  # Уменьшаем для ускорения
+        local_files_only=True  # Важно: только локальные файлы
     )
     
     try:
+        # Вариант 1: Обычное обучение с early stopping
+        print("=== ЗАПУСК ОБЫЧНОГО ОБУЧЕНИЯ ===")
         result = trainer.train(
             json_file_path=JSON_FILE_PATH,
             output_dir=OUTPUT_DIR,
-            epochs=3,
-            batch_size=16,
+            epochs=15,  # Максимум, но остановится раньше благодаря early stopping
+            batch_size=8,
             train_size=0.8
         )
         
+        # Вариант 2: Кросс-валидация (раскомментируйте для использования)
+        # print("\n=== ЗАПУСК КРОСС-ВАЛИДАЦИИ ===")
+        # cv_scores = trainer.train_with_cross_validation(
+        #     json_file_path=JSON_FILE_PATH,
+        #     output_dir=OUTPUT_DIR,
+        #     n_splits=3,  # 3-fold CV для 700 примеров
+        #     epochs=10,
+        #     batch_size=8
+        # )
+        
         if result is not None:
             print("Обучение завершено успешно!")
+            
+            # Тестирование сохраненной модели
+            print("\n=== ТЕСТИРОВАНИЕ МОДЕЛИ ===")
+            test_sentence = "Иван Иванов работает в компании Apple в Москве"
+            test_tokens = test_sentence.split()
+            
+            # Загрузка сохраненной модели для тестирования
+            from transformers import pipeline
+            
+            try:
+                ner_pipeline = pipeline(
+                    "ner",
+                    model=OUTPUT_DIR,
+                    tokenizer=OUTPUT_DIR,
+                    aggregation_strategy="simple"
+                )
+                
+                results = ner_pipeline(test_sentence)
+                print(f"Тестовое предложение: {test_sentence}")
+                print("Результаты NER:")
+                for entity in results:
+                    print(f"  {entity['word']} -> {entity['entity_group']} (score: {entity['score']:.3f})")
+                    
+            except Exception as e:
+                print(f"Ошибка при тестировании: {e}")
+                
         else:
             print("Обучение завершилось с ошибками!")
         
@@ -472,5 +643,32 @@ def main():
         import traceback
         traceback.print_exc()
 
+def download_model_locally(model_name="bert-base-multilingual-cased", local_dir="./local_model"):
+    """
+    Функция для предварительной загрузки модели (выполнить один раз)
+    """
+    if not os.path.exists(local_dir):
+        print(f"Загрузка модели {model_name} в {local_dir}...")
+        
+        # Скачиваем токенизатор
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer.save_pretrained(local_dir)
+        
+        # Скачиваем модель
+        model = AutoModelForTokenClassification.from_pretrained(model_name)
+        model.save_pretrained(local_dir)
+        
+        print(f"Модель сохранена в {local_dir}")
+    else:
+        print(f"Модель уже существует в {local_dir}")
+    
+    return local_dir
+
 if __name__ == "__main__":
+    # Перед первым запуском выполните эту функцию для загрузки модели:
+    # LOCAL_MODEL_PATH = download_model_locally()
+    
+    # Затем используйте локальную модель:
+    # trainer = NERModelTrainer(model_name=LOCAL_MODEL_PATH, local_files_only=True)
+    
     main()
