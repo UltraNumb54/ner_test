@@ -1,0 +1,299 @@
+import json
+import torch
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForSequenceClassification,
+    TrainingArguments, 
+    Trainer,
+    EarlyStoppingCallback
+)
+from datasets import Dataset, ClassLabel
+import evaluate
+import os
+from collections import Counter
+
+class TextClassifierTrainer:
+    def __init__(self, model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
+        """
+        Инициализация тренера для классификации текстов
+        """
+        self.model_name = model_name
+        self.tokenizer = None
+        self.model = None
+        self.label2id = {}
+        self.id2label = {}
+        
+    def load_and_prepare_data(self, json_file_path, text_field="original_text", 
+                            service_field="metadata.service", attachments_field="metadata.attachments_count"):
+        """
+        Загрузка и подготовка данных для обучения
+        """
+        print("Загрузка данных...")
+        with open(json_file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Фильтрация данных: только записи без attachments
+        filtered_data = []
+        for item in data:
+            attachments = item.get('metadata', {}).get('attachments_count', 0)
+            if attachments == 0:  # Только без attachments
+                service = item.get('metadata', {}).get('service')
+                text = item.get(text_field, '')
+                
+                if service and text and text.strip():
+                    filtered_data.append({
+                        'text': text.strip(),
+                        'service': service
+                    })
+        
+        print(f"Загружено {len(filtered_data)} записей без attachments")
+        
+        # Создание DataFrame
+        df = pd.DataFrame(filtered_data)
+        
+        # Анализ распределения классов
+        service_counts = df['service'].value_counts()
+        print("\nРаспределение классов:")
+        for service, count in service_counts.items():
+            print(f"  {service}: {count}")
+        
+        # Создание маппинга меток
+        unique_services = sorted(df['service'].unique())
+        self.label2id = {label: idx for idx, label in enumerate(unique_services)}
+        self.id2label = {idx: label for label, idx in self.label2id.items()}
+        
+        print(f"\nМаппинг меток: {self.label2id}")
+        
+        # Преобразование меток в числовой формат
+        df['label'] = df['service'].map(self.label2id)
+        
+        return df
+    
+    def balance_dataset(self, df, min_samples_per_class=10):
+        """
+        Балансировка датасета (upsampling для миноритарных классов)
+        """
+        print("\nБалансировка датасета...")
+        
+        # Группировка по классам
+        class_counts = df['label'].value_counts().sort_index()
+        print("Количество примеров по классам до балансировки:")
+        for label, count in class_counts.items():
+            print(f"  {self.id2label[label]}: {count}")
+        
+        # Upsampling миноритарных классов
+        balanced_dfs = []
+        max_samples = class_counts.max()
+        
+        for label in class_counts.index:
+            class_df = df[df['label'] == label]
+            current_count = len(class_df)
+            
+            if current_count < min_samples_per_class:
+                print(f"Предупреждение: класс {self.id2label[label]} имеет всего {current_count} примеров")
+                # Пропускаем классы с слишком малым количеством примеров
+                continue
+            
+            # Если класс слишком мал, делаем upsampling
+            if current_count < max_samples * 0.5:  # Если меньше половины от максимального
+                upsampled_df = class_df.sample(n=max_samples, replace=True, random_state=42)
+                balanced_dfs.append(upsampled_df)
+                print(f"  {self.id2label[label]}: upsampled с {current_count} до {len(upsampled_df)}")
+            else:
+                balanced_dfs.append(class_df)
+        
+        if balanced_dfs:
+            balanced_df = pd.concat(balanced_dfs, ignore_index=True)
+            print(f"После балансировки: {len(balanced_df)} примеров")
+            return balanced_df
+        else:
+            print("Недостаточно данных для балансировки")
+            return df
+    
+    def tokenize_function(self, examples):
+        """
+        Токенизация текстов
+        """
+        return self.tokenizer(
+            examples['text'],
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors=None
+        )
+    
+    def compute_metrics(self, eval_pred):
+        """
+        Вычисление метрик для оценки
+        """
+        metric = evaluate.load("accuracy")
+        predictions, labels = eval_pred
+        predictions = np.argmax(predictions, axis=1)
+        return metric.compute(predictions=predictions, references=labels)
+    
+    def train(self, json_file_path, output_dir="./text_classifier", 
+              test_size=0.2, epochs=10, batch_size=16, learning_rate=2e-5):
+        """
+        Обучение модели классификации текстов
+        """
+        # Загрузка и подготовка данных
+        df = self.load_and_prepare_data(json_file_path)
+        
+        if len(df) == 0:
+            raise ValueError("Нет данных для обучения!")
+        
+        # Балансировка датасета
+        balanced_df = self.balance_dataset(df)
+        
+        # Разделение на train/validation
+        train_df, val_df = train_test_split(
+            balanced_df, 
+            test_size=test_size, 
+            random_state=42,
+            stratify=balanced_df['label']
+        )
+        
+        print(f"\nРазделение данных:")
+        print(f"  Train: {len(train_df)} примеров")
+        print(f"  Validation: {len(val_df)} примеров")
+        
+        # Создание datasets
+        train_dataset = Dataset.from_pandas(train_df[['text', 'label']])
+        val_dataset = Dataset.from_pandas(val_df[['text', 'label']])
+        
+        # Инициализация токенизатора и модели
+        print(f"\nЗагрузка модели {self.model_name}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            self.model_name,
+            num_labels=len(self.label2id),
+            id2label=self.id2label,
+            label2id=self.label2id
+        )
+        
+        # Токенизация данных
+        print("Токенизация данных...")
+        tokenized_train = train_dataset.map(self.tokenize_function, batched=True)
+        tokenized_val = val_dataset.map(self.tokenize_function, batched=True)
+        
+        # Аргументы обучения
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            learning_rate=learning_rate,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            num_train_epochs=epochs,
+            weight_decay=0.01,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            load_best_model_at_end=True,
+            metric_for_best_model="accuracy",
+            greater_is_better=True,
+            logging_dir=f"{output_dir}/logs",
+            logging_steps=50,
+            save_total_limit=2,
+            seed=42,
+            warmup_steps=500,
+            remove_unused_columns=False,
+        )
+        
+        # Создание тренера
+        trainer = Trainer(
+            model=self.model,
+            args=training_args,
+            train_dataset=tokenized_train,
+            eval_dataset=tokenized_val,
+            tokenizer=self.tokenizer,
+            compute_metrics=self.compute_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
+        )
+        
+        # Обучение
+        print("Начало обучения...")
+        trainer.train()
+        
+        # Сохранение модели
+        print("Сохранение модели...")
+        trainer.save_model(output_dir)
+        self.tokenizer.save_pretrained(output_dir)
+        
+        # Сохранение информации о метках
+        label_info = {
+            'label2id': self.label2id,
+            'id2label': self.id2label
+        }
+        with open(f"{output_dir}/label_info.json", 'w', encoding='utf-8') as f:
+            json.dump(label_info, f, ensure_ascii=False, indent=2)
+        
+        # Финальная оценка
+        print("\nФинальная оценка...")
+        eval_results = trainer.evaluate()
+        print("Результаты оценки:")
+        for key, value in eval_results.items():
+            print(f"  {key}: {value:.4f}")
+        
+        # Детальная классификационный отчет
+        print("\nДетальный отчет по классификации:")
+        predictions = trainer.predict(tokenized_val)
+        y_pred = np.argmax(predictions.predictions, axis=1)
+        y_true = predictions.label_ids
+        
+        print(classification_report(y_true, y_pred, 
+                                  target_names=[self.id2label[i] for i in range(len(self.id2label))]))
+        
+        return trainer
+
+# Альтернативный вариант с моделью cis-lmu/glotlid
+class GlotLIDTextClassifierTrainer(TextClassifierTrainer):
+    def __init__(self):
+        super().__init__(model_name="cis-lmu/glotlid-6L")
+
+def main():
+    """
+    Основная функция для обучения классификатора
+    """
+    JSON_FILE_PATH = "inference_data.json"  # Укажите путь к вашему файлу
+    OUTPUT_DIR = "./service_classifier"
+    
+    # Проверка существования файла
+    if not os.path.exists(JSON_FILE_PATH):
+        print(f"Ошибка: файл {JSON_FILE_PATH} не найден!")
+        return
+    
+    try:
+        # Сначала анализируем статистику
+        print("=== АНАЛИЗ СТАТИСТИКИ ===")
+        service_stats, data = analyze_dataset_statistics(JSON_FILE_PATH)
+        
+        # Затем обучаем модель
+        print("\n=== ОБУЧЕНИЕ МОДЕЛИ ===")
+        
+        # Выбор модели (раскомментируйте нужную)
+        trainer = TextClassifierTrainer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+        # trainer = GlotLIDTextClassifierTrainer()  # Альтернативный вариант
+        
+        result = trainer.train(
+            json_file_path=JSON_FILE_PATH,
+            output_dir=OUTPUT_DIR,
+            epochs=10,
+            batch_size=16,
+            learning_rate=2e-5
+        )
+        
+        if result is not None:
+            print(f"\nОбучение завершено успешно! Модель сохранена в {OUTPUT_DIR}")
+        else:
+            print("Обучение завершилось с ошибками!")
+        
+    except Exception as e:
+        print(f"Ошибка при обучении: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
