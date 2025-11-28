@@ -18,10 +18,11 @@ class ServiceClassifier:
             self.label2id = label_info['label2id']
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Используется устройство: {self.device}")
         self.model.to(self.device)
         self.model.eval()
     
-    def predict(self, text, return_probabilities=False):
+    def predict(self, text, return_probabilities=False, top_k=3):
         """
         Предсказание service для текста
         """
@@ -47,14 +48,18 @@ class ServiceClassifier:
         predicted_service = self.id2label[str(predicted_class_id)]
         
         if return_probabilities:
-            # Возвращаем все вероятности
+            # Возвращаем топ-K вероятностей
             all_probs = probabilities.cpu().numpy()[0]
-            prob_dict = {self.id2label[str(i)]: float(prob) for i, prob in enumerate(all_probs)}
-            return predicted_service, prob_dict
+            top_k_indices = np.argsort(all_probs)[-top_k:][::-1]
+            top_k_probs = {
+                self.id2label[str(i)]: float(all_probs[i]) 
+                for i in top_k_indices
+            }
+            return predicted_service, top_k_probs
         else:
             return predicted_service
     
-    def predict_batch(self, texts, return_probabilities=False):
+    def predict_batch(self, texts, return_probabilities=False, top_k=3):
         """
         Пакетное предсказание для списка текстов
         """
@@ -62,7 +67,7 @@ class ServiceClassifier:
         
         for text in texts:
             if return_probabilities:
-                prediction, probabilities = self.predict(text, return_probabilities=True)
+                prediction, probabilities = self.predict(text, return_probabilities=True, top_k=top_k)
                 results.append({
                     'text': text,
                     'predicted_service': prediction,
@@ -92,21 +97,22 @@ def test_classifier():
             "Помогите настроить подключение к интернету",
             "Не работает принтер в офисе",
             "Нужно обновить программное обеспечение",
-            "Проблема с электронной почтой"
+            "Проблема с электронной почтой",
+            "Сломался компьютер, не включается"
         ]
         
         print("Тестирование классификатора:")
-        print("-" * 50)
+        print("=" * 60)
         
-        results = classifier.predict_batch(test_texts, return_probabilities=True)
+        results = classifier.predict_batch(test_texts, return_probabilities=True, top_k=3)
         
-        for result in results:
-            print(f"Текст: {result['text']}")
-            print(f"Предсказанный service: {result['predicted_service']}")
-            print("Вероятности:")
-            for service, prob in sorted(result['probabilities'].items(), key=lambda x: x[1], reverse=True)[:3]:
-                print(f"  {service}: {prob:.4f}")
-            print("-" * 30)
+        for i, result in enumerate(results, 1):
+            print(f"{i}. Текст: {result['text']}")
+            print(f"   Предсказанный service: {result['predicted_service']}")
+            print("   Топ-3 вероятности:")
+            for service, prob in result['probabilities'].items():
+                print(f"     {service}: {prob:.4f}")
+            print("-" * 40)
             
     except Exception as e:
         print(f"Ошибка при тестировании классификатора: {e}")
