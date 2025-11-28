@@ -1,21 +1,44 @@
-from transformers import AutoModelForTokenClassification, AutoTokenizer
+import os
+from huggingface_hub import snapshot_download
+from transformers import AutoConfig
 
-# Укажите правильный путь к папке с моделью
-model_path = "/путь/к/вашей/модели/bert-base-multilingual-cased"
+def check_model_files(model_name="bert-base-multilingual-cased", local_dir="./bert-base-multilingual-cased"):
+    """Проверка размера и содержания файлов модели"""
+    
+    print("🔍 ДИАГНОСТИКА МОДЕЛИ:")
+    print(f"Модель: {model_name}")
+    print(f"Локальная папка: {local_dir}")
+    
+    if os.path.exists(local_dir):
+        total_size = 0
+        file_count = 0
+        
+        print("\n📁 Содержимое папки:")
+        for root, dirs, files in os.walk(local_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                file_size = os.path.getsize(file_path)
+                total_size += file_size
+                file_count += 1
+                print(f"  {file}: {file_size / (1024*1024):.2f} MB")
+        
+        print(f"\n📊 Итого: {file_count} файлов, {total_size / (1024*1024):.2f} MB")
+        
+        # Проверяем наличие ключевых файлов
+        essential_files = ['config.json', 'pytorch_model.bin', 'model.safetensors', 'vocab.txt']
+        missing_files = []
+        
+        for essential_file in essential_files:
+            if not any(essential_file in f for f in os.listdir(local_dir)):
+                missing_files.append(essential_file)
+        
+        if missing_files:
+            print(f"❌ Отсутствуют файлы: {missing_files}")
+        else:
+            print("✅ Все ключевые файлы на месте")
+            
+    else:
+        print("❌ Папка с моделью не существует!")
 
-# Загрузка с использованием только локальных файлов
-try:
-    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-    model = AutoModelForTokenClassification.from_pretrained(model_path, local_files_only=True)
-    print("Модель и токенизатор успешно загружены локально")
-except Exception as e:
-    print(f"Ошибка при загрузке локальных файлов: {e}")
-
-
-try:
-    # Попытка загрузить модель из стандартного кэша
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
-    model = AutoModelForTokenClassification.from_pretrained("bert-base-multilingual-cased")
-    print("Модель присутствует в кэше.")
-except Exception as e:
-    print(f"Модель не найдена в кэше. Ошибка: {e}")
+# Запустите диагностику
+check_model_files()
