@@ -1,0 +1,143 @@
+import json
+import pandas as pd
+from collections import Counter
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def analyze_dataset_statistics(json_file_path):
+    """
+    Анализ статистики датасета: распределение service и attachments
+    """
+    print("=== АНАЛИЗ СТАТИСТИКИ ДАТАСЕТА ===")
+    
+    # Загрузка данных
+    with open(json_file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    print(f"Общее количество записей: {len(data)}")
+    
+    # Сбор статистики
+    service_stats = {}
+    total_with_attachments = 0
+    total_without_attachments = 0
+    
+    for item in data:
+        service = item.get('metadata', {}).get('service', 'unknown')
+        attachments_count = item.get('metadata', {}).get('attachments_count', 0)
+        
+        if service not in service_stats:
+            service_stats[service] = {
+                'total': 0,
+                'with_attachments': 0,
+                'without_attachments': 0
+            }
+        
+        service_stats[service]['total'] += 1
+        
+        if attachments_count > 0:
+            service_stats[service]['with_attachments'] += 1
+            total_with_attachments += 1
+        else:
+            service_stats[service]['without_attachments'] += 1
+            total_without_attachments += 1
+    
+    # Вывод статистики
+    print(f"\nОбщая статистика по attachments:")
+    print(f"  - С attachments: {total_with_attachments} ({total_with_attachments/len(data)*100:.1f}%)")
+    print(f"  - Без attachments: {total_without_attachments} ({total_without_attachments/len(data)*100:.1f}%)")
+    
+    print(f"\nСтатистика по service:")
+    print("-" * 80)
+    print(f"{'Service':<30} {'Total':<8} {'With Attach':<12} {'Without Attach':<14} {'% Without'}")
+    print("-" * 80)
+    
+    for service, stats in sorted(service_stats.items(), key=lambda x: x[1]['total'], reverse=True):
+        total = stats['total']
+        with_att = stats['with_attachments']
+        without_att = stats['without_attachments']
+        pct_without = (without_att / total) * 100 if total > 0 else 0
+        
+        print(f"{service:<30} {total:<8} {with_att:<12} {without_att:<14} {pct_without:.1f}%")
+    
+    return service_stats, data
+
+# Визуализация статистики
+def plot_statistics(service_stats):
+    """
+    Визуализация статистики датасета
+    """
+    # Подготовка данных для визуализации
+    services = []
+    totals = []
+    with_attachments = []
+    without_attachments = []
+    
+    for service, stats in sorted(service_stats.items(), key=lambda x: x[1]['total'], reverse=True):
+        services.append(service)
+        totals.append(stats['total'])
+        with_attachments.append(stats['with_attachments'])
+        without_attachments.append(stats['without_attachments'])
+    
+    # Создание графиков
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # График 1: Общее распределение по service
+    ax1.bar(services, totals, color='skyblue')
+    ax1.set_title('Распределение записей по service')
+    ax1.set_ylabel('Количество записей')
+    ax1.tick_params(axis='x', rotation=45)
+    
+    # График 2: Соотношение с/без attachments по service
+    x = range(len(services))
+    width = 0.35
+    ax2.bar(x, with_attachments, width, label='С attachments', color='lightcoral')
+    ax2.bar([i + width for i in x], without_attachments, width, label='Без attachments', color='lightgreen')
+    ax2.set_title('Распределение attachments по service')
+    ax2.set_ylabel('Количество записей')
+    ax2.set_xticks([i + width/2 for i in x])
+    ax2.set_xticklabels(services, rotation=45)
+    ax2.legend()
+    
+    # График 3: Процент записей без attachments по service
+    percentages = [(without / total) * 100 for without, total in zip(without_attachments, totals)]
+    ax3.bar(services, percentages, color='lightgreen')
+    ax3.set_title('Процент записей БЕЗ attachments по service')
+    ax3.set_ylabel('Процент без attachments')
+    ax3.tick_params(axis='x', rotation=45)
+    
+    # График 4: Круговой график общего распределения attachments
+    attach_labels = ['С attachments', 'Без attachments']
+    attach_sizes = [sum(with_attachments), sum(without_attachments)]
+    colors = ['lightcoral', 'lightgreen']
+    ax4.pie(attach_sizes, labels=attach_labels, colors=colors, autopct='%1.1f%%', startangle=90)
+    ax4.set_title('Общее распределение attachments')
+    
+    plt.tight_layout()
+    plt.savefig('dataset_statistics.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+# Основной анализ
+if __name__ == "__main__":
+    JSON_FILE_PATH = "inference_data.json"  # Укажите путь к вашему файлу
+    
+    try:
+        service_stats, data = analyze_dataset_statistics(JSON_FILE_PATH)
+        plot_statistics(service_stats)
+        
+        # Дополнительная информация о данных для обучения
+        print(f"\n=== ДАННЫЕ ДЛЯ ОБУЧЕНИЯ ===")
+        
+        # Подсчет записей без attachments для обучения
+        training_data_count = sum(stats['without_attachments'] for stats in service_stats.values())
+        print(f"Всего записей для обучения (без attachments): {training_data_count}")
+        
+        # Проверка сбалансированности классов для обучения
+        print("\nРаспределение классов для обучения:")
+        for service, stats in service_stats.items():
+            if stats['without_attachments'] > 0:
+                print(f"  {service}: {stats['without_attachments']} записей")
+                
+    except FileNotFoundError:
+        print(f"Файл {JSON_FILE_PATH} не найден!")
+    except Exception as e:
+        print(f"Ошибка при анализе данных: {e}")
